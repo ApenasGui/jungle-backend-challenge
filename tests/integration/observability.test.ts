@@ -114,3 +114,28 @@ test('conflito real de lock incrementa contador e retry antes de recuperar', asy
     await runner.release(); await reading.catch(() => {});
   }
 });
+
+test('reconciliação detecta divergência, gera métrica e não corrige o saldo silenciosamente', async () => {
+  app = await createApplication(db.source, true); await app.listen(0, '127.0.0.1');
+  const base = await app.getUrl(); const service = app.get(FinancialService);
+  const owner = await service.createWallet({ playerId: crypto.randomUUID(),
+    initialBalance: { amount: '100.00', currency: 'BRL' } }, { correlationId: 'opening' });
+  const log = spyOn(console, 'warn').mockImplementation(() => {});
+  try {
+    // Corrupção simulada somente no banco descartável; o trigger volta antes da consulta.
+    await db.source.query('ALTER TABLE wallets DISABLE TRIGGER wallet_matches_ledger');
+    try { await db.source.query('UPDATE wallets SET balance=99.00 WHERE id=$1', [owner.id]); }
+    finally { await db.source.query('ALTER TABLE wallets ENABLE TRIGGER wallet_matches_ledger'); }
+    const response = await fetch(`${base}/wallets/${owner.id}/reconciliation`, { method: 'POST',
+      headers: { 'x-correlation-id': 'drift-test' } });
+    expect(response.status).toBe(200);
+    const result = await response.json() as { consistent: boolean; difference: { amount: string } };
+    expect(result.consistent).toBe(false); expect(result.difference.amount).toBe('-1.00');
+    expect((await service.getWallet(owner.id)).balance.amount).toBe('99.00');
+    expect(await (await fetch(`${base}/metrics`)).text()).toContain('wagering_reconciliation_mismatches_total 1');
+    expect(log.mock.calls.map(args => String(args[0])).join('')).toContain('"correlationId":"drift-test"');
+  } finally {
+    log.mockRestore();
+    await db.source.query('UPDATE wallets SET balance=100.00 WHERE id=$1', [owner.id]);
+  }
+});

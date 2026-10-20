@@ -6,6 +6,7 @@ import { Wallet } from '../../domain/wallet';
 import { WagerTransaction } from '../../domain/wager-transaction';
 import { WalletLedgerEntry } from '../../domain/wallet-ledger-entry';
 import { InboxMessage } from '../../domain/inbox-message';
+import { OutboxMessage } from '../../domain/outbox-message';
 import { InboxSchema, LedgerSchema, OutboxSchema, TransactionSchema, WalletSchema } from './entities/financial.schemas';
 import { ledgerFromRow, ledgerToRow, transactionFromRow, transactionToRow, walletFromRow, walletToRow } from './financial-mappers';
 
@@ -104,9 +105,7 @@ class TypeOrmFinancialSession implements FinancialSession {
   }
   async insertLedger(entry: WalletLedgerEntry) { await this.manager.insert(LedgerSchema, ledgerToRow(entry)); }
   async enqueue(event: IntegrationEvent) {
-    await this.manager.save(OutboxSchema, { id: event.eventId, aggregateId: event.aggregateId,
-      eventType: event.eventType, payload: event.toJSON(), occurredAt: event.occurredAt,
-      attempts: 0, nextAttemptAt: event.occurredAt, publishedAt: null });
+    await this.manager.save(OutboxSchema, OutboxMessage.enqueue(event).snapshot());
   }
   async ledger(walletId: string, version: number, limit: number) {
     const rows = await this.manager.find(LedgerSchema, { where: { walletId, walletVersion: MoreThan(version) },

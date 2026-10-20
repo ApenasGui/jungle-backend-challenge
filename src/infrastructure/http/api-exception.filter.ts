@@ -7,7 +7,9 @@ export class ApiExceptionFilter implements ExceptionFilter {
   // Erros de SQL e payloads financeiros nunca são expostos na resposta ou nos logs.
   catch(error: unknown, host: ArgumentsHost): void {
     let status = 500; let code = 'INTERNAL_ERROR';
-    if (error instanceof ApplicationError) {
+    if (error instanceof Error && 'type' in error && error.type === 'entity.too.large') {
+      status = 413; code = 'PAYLOAD_TOO_LARGE';
+    } else if (error instanceof ApplicationError) {
       status = { INVALID_PAYLOAD: 400, NOT_FOUND: 404, CONFLICT: 409, SERVICE_UNAVAILABLE: 503 }[error.code];
       code = error.message;
     } else if (error instanceof DomainError) {

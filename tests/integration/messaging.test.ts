@@ -227,6 +227,33 @@ test('referência inexistente tem backoff e rejeição auditável no TTL', async
   expect(result.status).toBe('REJECTED'); expect(result.failureCode).toBe('REFERENCE_NOT_FOUND');
   expect(await balance(owner.id)).toBe('100.00');
 });
+
+test('referência inexistente termina na centésima tentativa sem agendar a 101', async () => {
+  const owner = await wallet();
+  const pending = await service.submit(command(owner, { kind: 'REFUND', referenceExternalTransactionId: 'missing' }),
+    crypto.randomUUID(), ctx);
+  await db.source.query("UPDATE wager_transactions SET reference_attempts=99,next_reference_attempt_at=now() WHERE id=$1",
+    [pending.transactionId]);
+  await new ReferenceWorker(db.source, service).runOnce();
+  const row = await db.source.getRepository(TransactionSchema).findOneByOrFail({ id: pending.transactionId });
+  expect(row.status).toBe('REJECTED');
+  expect(row.referenceAttempts).toBe(100);
+  expect(row.nextReferenceAttemptAt).toBeNull();
+  expect(row.failureCode).toBe('REFERENCE_NOT_FOUND');
+});
+
+test('referência recebida antes da última tentativa ainda pode ser processada', async () => {
+  const owner = await wallet(); const bet = command(owner);
+  const pending = await service.submit(command(owner, { kind: 'REFUND', referenceExternalTransactionId: bet.externalTransactionId }),
+    crypto.randomUUID(), ctx);
+  await service.submit(bet, crypto.randomUUID(), ctx);
+  await db.source.query("UPDATE wager_transactions SET reference_attempts=99,next_reference_attempt_at=now() WHERE id=$1",
+    [pending.transactionId]);
+  await new ReferenceWorker(db.source, service).runOnce();
+  const row = await db.source.getRepository(TransactionSchema).findOneByOrFail({ id: pending.transactionId });
+  expect(row.status).toBe('PROCESSED'); expect(row.referenceAttempts).toBe(100);
+  expect(await balance(owner.id)).toBe('100.00');
+});
 test('shutdown interrompe long polling sem esperar os 20 segundos', async () => {
   const runtime = new WorkerRuntime(db.source, queues.client, queues.config);
   runtime.start(); await Bun.sleep(50); const start = performance.now();

@@ -116,6 +116,10 @@ export class FinancialService {
           await session.enqueue(WalletBalanceChanged.from(entry, ctx));
         }
       }
+      // A última tentativa ainda pode resolver a referência, mas não agenda uma 101ª.
+      if (tx.status === 'PENDING_REFERENCE' && attempts >= 100) {
+        tx.reject('REFERENCE_NOT_FOUND', now, wallet.balance);
+      }
       const next = tx.status === 'PENDING_REFERENCE'
         ? new Date(now.getTime() + Math.min(1000 * 2 ** Math.min(attempts, 20), 15 * 60 * 1000)) : null;
       await session.updateTransaction(tx, attempts, next, schedule.expiresAt);

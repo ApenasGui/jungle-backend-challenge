@@ -58,7 +58,7 @@ bun run test:integration
 
 A suíte cria bancos exclusivos `wagering_test_<uuid>` e os remove ao terminar; não limpa nem reverte o banco de desenvolvimento. `TEST_DATABASE_ADMIN_URL` deve apontar para PostgreSQL local com permissão de criar bancos. Os testes de banco aplicam suas próprias migrations e não dependem da aplicação prévia em `wagering`. Uma interrupção forçada do processo pode deixar um banco temporário para limpeza manual.
 
-São 85 testes unitários, 91 de integração/HTTP/mensageria/observabilidade e 5 de concorrência. Os testes reais cobrem persistência decimal, unicidade, imutabilidade, cadeia do ledger, reversões, rollback antes e durante o commit e configuração FIFO/DLQ do LocalStack. Também verificam contratos HTTP, replay, paginação, indisponibilidade e falha de gravação da outbox. Após cada teste financeiro, o saldo é comparado com a soma do ledger. Os testes de mensageria criam e removem filas próprias; não consomem as filas de desenvolvimento. `bun test --timeout 30000` executa todas as suítes e exige os containers ativos.
+São 88 testes unitários, 95 de integração/HTTP/mensageria/observabilidade e 5 de concorrência. Os testes reais cobrem persistência decimal, unicidade, imutabilidade, cadeia do ledger, reversões, rollback antes e durante o commit e configuração FIFO/DLQ do LocalStack. Também verificam contratos HTTP, replay, paginação, indisponibilidade e falha de gravação da outbox. Após cada teste financeiro, o saldo é comparado com a soma do ledger. Os testes de mensageria criam e removem filas próprias; não consomem as filas de desenvolvimento. `bun test --timeout 30000` executa todas as suítes e exige os containers ativos.
 
 A suíte de concorrência inicia três processos reais da API em portas aleatórias: envia 50 duplicatas, disputa saldo, testa chaves globais entre wallets e verifica independência dos locks. Também reinicia um processo e confirma replay persistente. A suíte de mensageria encerra processos reais após commit/antes do ack e após envio/antes de marcar a outbox, verificando a recuperação. Inclui publishers concorrentes, retry, DLQ, TTL e shutdown. Os processos, bancos e filas temporários são removidos ao terminar.
 
@@ -107,7 +107,7 @@ A outbox usa entrega pelo menos uma vez: consumidores dos eventos devem deduplic
 
 Valores monetários devem ser strings com exatamente duas casas. Campos desconhecidos são rejeitados. `OPENING` é interno. O cursor do ledger é opaco, restrito à wallet e usa sua versão monotônica; `limit` aceita de 1 a 100.
 
-Respostas: `201` na criação de wallet; `200` em operações processadas e consultas; `202` para processamento pendente; `400` para contrato inválido; `404` para recurso ausente; `409` para conflito de chave/ID externo ou wallet duplicada; `422` para rejeição de negócio; `503` para indisponibilidade transitória. Erros internos retornam `500` sem detalhes SQL. Consultar uma transação rejeitada retorna `200` com seu estado; submetê-la novamente retorna `422` com `idempotentReplay: true`.
+Respostas: `201` na criação de wallet; `200` em operações processadas e consultas; `202` para processamento pendente; `400` para contrato inválido; `413` para corpo acima do limite do parser; `404` para recurso ausente; `409` para conflito de chave/ID externo ou wallet duplicada; `422` para rejeição de negócio; `503` para indisponibilidade transitória. Erros internos retornam `500` sem detalhes SQL. Consultar uma transação rejeitada retorna `200` com seu estado; submetê-la novamente retorna `422` com `idempotentReplay: true`.
 
 Exemplo em PowerShell, após iniciar a API:
 
@@ -172,4 +172,4 @@ Se a outbox acumular eventos, verifique readiness do worker, configuração da f
 - `scripts`: comandos de manutenção explícitos.
 - `tests/unit`, `tests/integration`, `tests/concurrency`: testes por finalidade.
 
-Consulte `ARCHITECTURE.md` para decisões e pendências.
+Consulte `ARCHITECTURE.md` para decisões e limitações e [CHALLENGE_REVIEW.md](CHALLENGE_REVIEW.md) para a revisão de aderência ao enunciado.

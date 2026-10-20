@@ -5,7 +5,7 @@ import type { TransactionPayload } from './transaction-payload';
 const uuidPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 function invalid(): never { throw new ApplicationError('INVALID_PAYLOAD'); }
 
-// A mesma validação é usada por HTTP e pelos futuros consumidores de mensagens.
+// A mesma validação é usada por HTTP e pelos consumidores de mensagens.
 function object(value: unknown, allowed: string[]): Record<string, unknown> {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return invalid();
   const result = value as Record<string, unknown>;

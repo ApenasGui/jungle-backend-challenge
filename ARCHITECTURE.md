@@ -62,7 +62,7 @@ O adaptador limita espera por lock a 3 segundos e cada comando SQL a 10 segundos
 
 O schema mantém inbox com chave `(consumerName, messageId)` e outbox com índice de publicação pendente. Os eventos possuem subclasses concretas de um envelope abstrato com ID, versão, correlação e valores monetários serializados. Abertura positiva emite evento de transação processada e de saldo alterado; `LOSS` e rejeições não emitem mudança de saldo. Replay não emite novos eventos.
 
-Referências ausentes recebem agendamento inicial em 1 segundo e expiração em 24 horas. O worker busca lotes de 20 e revalida estado e agendamento sob lock da wallet. O backoff cresce exponencialmente até 15 minutos. Após 100 tentativas ou expiração, a transação é rejeitada com `REFERENCE_NOT_FOUND`. Duas instâncias podem buscar a mesma candidata, mas apenas uma aplica a transição. O Compose configura filas FIFO de entrada, DLQ e saída; a deduplicação do broker é uma otimização, não a garantia financeira.
+Referências ausentes recebem agendamento inicial em 1 segundo e expiração em 24 horas. O worker busca lotes de 20 e revalida estado e agendamento sob lock da wallet. O backoff cresce exponencialmente até 15 minutos. Na centésima tentativa ainda sem referência, ou na expiração, a transação é rejeitada com `REFERENCE_NOT_FOUND`. Duas instâncias podem buscar a mesma candidata, mas apenas uma aplica a transição. O Compose configura filas FIFO de entrada, DLQ e saída; a deduplicação do broker é uma otimização, não a garantia financeira.
 
 ## Mensageria e recuperação
 
@@ -109,7 +109,7 @@ O ledger usa cursor opaco contendo wallet e versão. A versão é imutável e es
 
 Os testes unitários verificam dinheiro, operações, rejeições, referências, estados terminais, hash, snapshots e mapeamentos. A validação de metadados TypeORM não abre conexão. O teste sequencial de duas apostas verifica a regra de saldo, mas não comprova concorrência real.
 
-Os 91 testes de integração/HTTP/mensageria/observabilidade usam PostgreSQL 17.6 e LocalStack 4.7.0 reais. Verificam migrations, constraints, ledger, referências, unicidade da inbox, atomicidade SQL, contratos, replay, paginação e erros. Uma falha injetada na inserção da outbox confirma que o endpoint não deixa débito parcial. Depois de cada teste financeiro, a suíte reconstrói o saldo somando o ledger. Cada execução cria e remove seu próprio banco. A mensageria usa filas temporárias e cobre retry, DLQ, publishers concorrentes, TTL, falhas de processos e shutdown.
+Os 95 testes de integração/HTTP/mensageria/observabilidade usam PostgreSQL 17.6 e LocalStack 4.7.0 reais. Verificam migrations, constraints, ledger, referências, unicidade da inbox, atomicidade SQL, contratos, replay, paginação e erros. Uma falha injetada na inserção da outbox confirma que o endpoint não deixa débito parcial. Depois de cada teste financeiro, a suíte reconstrói o saldo somando o ledger. Cada execução cria e remove seu próprio banco. A mensageria usa filas temporárias e cobre retry, DLQ, publishers concorrentes, TTL, falhas de processos e shutdown.
 
 A execução real identificou e corrigiu uma expressão `CASE` que precisava de parênteses dentro do `IF` de um trigger. Também confirmou que `Infinity` falha no próprio `NUMERIC(20,2)` com SQLSTATE `22003`, enquanto `NaN` é recusado pelo check com `23514`.
 
