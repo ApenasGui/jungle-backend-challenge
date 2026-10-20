@@ -1,5 +1,5 @@
 import type { INestApplication } from '@nestjs/common';
-import { FinancialDiagnosticsService } from './financial-diagnostics';
+import { FinancialDiagnosticsService } from '../observability/financial-diagnostics';
 
 interface Request {
   headers: Record<string, string | string[] | undefined>;

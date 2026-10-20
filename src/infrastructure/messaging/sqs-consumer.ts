@@ -6,7 +6,7 @@ import { ApplicationError } from '../../application/application-error';
 import { identifier } from '../../application/contracts';
 import { DomainError } from '../../domain/domain-error';
 import type { QueueConfig } from './sqs-config';
-import { WorkerMetrics } from './worker-metrics';
+import { OperationalMetrics } from '../observability/metrics';
 
 interface Envelope {
   messageId: string; type: 'WagerTransactionRequested'; occurredAt: string;
@@ -28,7 +28,7 @@ export class SqsConsumer {
   private readonly receiveAbort = new AbortController();
   private stopping = false;
   constructor(private readonly client: SQSClient, private readonly queues: QueueConfig,
-    private readonly service: FinancialService, private readonly metrics = new WorkerMetrics(),
+    private readonly service: FinancialService, private readonly metrics = new OperationalMetrics(),
     private readonly hooks: { afterCommit?: () => Promise<void> } = {}) {}
 
   stop(): void { this.stopping = true; this.receiveAbort.abort(); }

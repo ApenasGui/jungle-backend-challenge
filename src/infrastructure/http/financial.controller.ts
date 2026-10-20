@@ -1,7 +1,7 @@
 import { Body, Controller, Get, Headers, HttpCode, Inject, Param, Post, Query, Res, UseGuards } from '@nestjs/common';
 import { FinancialService } from '../../application/financial-service';
 import type { EventContext } from '../../application/integration-events';
-import { FinancialDiagnosticsService } from './financial-diagnostics';
+import { FinancialDiagnosticsService } from '../observability/financial-diagnostics';
 import { safeIdentifier } from './http-observability';
 import { ProviderAuthGuard } from './provider-auth.guard';
 

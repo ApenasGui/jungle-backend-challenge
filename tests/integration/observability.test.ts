@@ -2,7 +2,7 @@ import { afterEach, beforeEach, expect, spyOn, test } from 'bun:test';
 import type { INestApplication } from '@nestjs/common';
 import { createApplication } from '../../src/bootstrap';
 import { Operations } from '../../src/infrastructure/observability/operations';
-import { WorkerMetrics } from '../../src/infrastructure/messaging/worker-metrics';
+import { OperationalMetrics } from '../../src/infrastructure/observability/metrics';
 import { TypeOrmFinancialStore } from '../../src/infrastructure/database/typeorm-financial-store';
 import { FinancialService } from '../../src/application/financial-service';
 import { createTestDatabase } from './database';
@@ -10,12 +10,13 @@ import { createTestQueues } from './queue-fixture';
 
 let db: Awaited<ReturnType<typeof createTestDatabase>>;
 let queues: Awaited<ReturnType<typeof createTestQueues>>;
-let metrics: WorkerMetrics;
+let metrics: OperationalMetrics;
 let operations: Operations;
 let app: INestApplication | undefined;
 beforeEach(async () => {
   db = await createTestDatabase(); queues = await createTestQueues();
-  metrics = new WorkerMetrics(); operations = new Operations(db.source, queues.client, queues.config, metrics);
+  metrics = new OperationalMetrics();
+  operations = new Operations(db.source, queues.client, queues.config, metrics, { ttlMs: 0, now: () => performance.now() });
 });
 afterEach(async () => {
   try {
@@ -57,6 +58,43 @@ test('outbox lag usa evento pendente mais antigo e zera ao drenar', async () => 
   expect(Number(report.match(/wagering_outbox_lag_seconds (\S+)/)?.[1])).toBeGreaterThanOrEqual(120);
   await db.source.query('UPDATE outbox_messages SET published_at=now()');
   expect(await operations.collect()).toContain('wagering_outbox_lag_seconds 0');
+});
+test('scrapes concorrentes compartilham SQL e cache sem congelar contadores locais', async () => {
+  let now = 0;
+  const cached = new Operations(db.source, queues.client, queues.config, metrics, { ttlMs: 5000, now: () => now });
+  const query = spyOn(db.source, 'query');
+  try {
+    const reports = await Promise.all(Array.from({ length: 20 }, () => cached.collect()));
+    expect(new Set(reports).size).toBe(1);
+    expect(query).toHaveBeenCalledTimes(2);
+    metrics.increment('wagering_duplicates_total');
+    expect(await cached.collect()).toContain('wagering_duplicates_total 1');
+    now = 4999; await cached.collect();
+    expect(query).toHaveBeenCalledTimes(2);
+    now = 5000; await cached.collect();
+    expect(query).toHaveBeenCalledTimes(4);
+  } finally { query.mockRestore(); }
+});
+test('cache limita retries da coleta e recupera gauges após indisponibilidade', async () => {
+  let now = 0;
+  const cached = new Operations(db.source, queues.client, queues.config, metrics, { ttlMs: 5000, now: () => now });
+  await cached.collect();
+  await db.source.destroy();
+  // Readiness continua verificando dependências mesmo durante a validade do cache.
+  expect((await cached.ready()).checks.postgres).toBe(false);
+  now = 5000;
+  const query = spyOn(db.source, 'query');
+  try {
+    const failed = await cached.collect();
+    expect(failed).toContain('wagering_outbox_collection_success 0');
+    expect(failed).not.toContain('wagering_outbox_pending ');
+    expect(failed).not.toContain('wagering_transactions_current{');
+    await Promise.all(Array.from({ length: 20 }, () => cached.collect()));
+    expect(query).toHaveBeenCalledTimes(2);
+    await db.source.initialize(); now = 10000;
+    expect(await cached.collect()).toContain('wagering_outbox_collection_success 1');
+    expect(await cached.collect()).toContain('wagering_outbox_pending 0');
+  } finally { query.mockRestore(); }
 });
 test('API responde readiness 200 e mantém liveness quando o banco cai', async () => {
   app = await createApplication(db.source, true); await app.listen(0, '127.0.0.1');

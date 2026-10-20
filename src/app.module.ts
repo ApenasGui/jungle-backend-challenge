@@ -5,7 +5,8 @@ import { FinancialController } from './infrastructure/http/financial.controller'
 import { FinancialService } from './application/financial-service';
 import { createDataSource } from './infrastructure/database/data-source';
 import { TypeOrmFinancialStore } from './infrastructure/database/typeorm-financial-store';
-import { FinancialDiagnosticsService, MetricsController } from './infrastructure/http/financial-diagnostics';
+import { FinancialDiagnosticsService } from './infrastructure/observability/financial-diagnostics';
+import { MetricsController } from './infrastructure/http/metrics.controller';
 import { SQSClient } from '@aws-sdk/client-sqs';
 import { createSqsClient, queueConfig } from './infrastructure/messaging/sqs-config';
 import { Operations } from './infrastructure/observability/operations';

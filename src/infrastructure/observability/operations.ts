@@ -2,13 +2,16 @@ import { Client } from 'pg';
 import { GetQueueAttributesCommand, type SQSClient } from '@aws-sdk/client-sqs';
 import type { DataSource } from 'typeorm';
 import type { QueueConfig } from '../messaging/sqs-config';
-import type { WorkerMetrics } from '../messaging/worker-metrics';
+import type { OperationalMetrics } from './metrics';
 
 // As sondas só consultam dependências; não recebem nem removem mensagens.
 export class Operations {
   private stopping = false;
+  private nextCollectionAt = -Infinity;
+  private collection?: Promise<void>;
   constructor(private readonly source: DataSource, private readonly client: SQSClient,
-    private readonly queues: QueueConfig, private readonly metrics: WorkerMetrics) {}
+    private readonly queues: QueueConfig, private readonly metrics: OperationalMetrics,
+    private readonly cache = { ttlMs: 5000, now: () => performance.now() }) {}
 
   stop(): void { this.stopping = true; }
 
@@ -34,6 +37,18 @@ export class Operations {
   }
 
   async collect(): Promise<string> {
+    // Scrapes simultâneos compartilham a consulta; só os gauges SQL ficam em cache.
+    if (!this.collection && this.cache.now() >= this.nextCollectionAt) {
+      this.collection = this.collectDatabaseMetrics().finally(() => {
+        this.nextCollectionAt = this.cache.now() + this.cache.ttlMs;
+        this.collection = undefined;
+      });
+    }
+    if (this.collection) await this.collection;
+    return this.metrics.render();
+  }
+
+  private async collectDatabaseMetrics(): Promise<void> {
     try {
       const [row] = await this.source.query(`SELECT count(*)::int AS pending,
         COALESCE(EXTRACT(EPOCH FROM now() - min(occurred_at)),0)::float8 AS lag
@@ -57,6 +72,5 @@ export class Operations {
       for (const status of statuses) this.metrics.removeGauge(`wagering_transactions_current{status="${status}"}`);
       this.metrics.gauge('wagering_transactions_collection_success', 0);
     }
-    return this.metrics.render();
   }
 }

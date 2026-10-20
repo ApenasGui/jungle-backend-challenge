@@ -1,10 +1,10 @@
 import type { DataSource } from 'typeorm';
 import type { FinancialService } from '../../application/financial-service';
-import { WorkerMetrics } from './worker-metrics';
+import { OperationalMetrics } from '../observability/metrics';
 
 export class ReferenceWorker {
   constructor(private readonly source: DataSource, private readonly service: FinancialService,
-    private readonly metrics = new WorkerMetrics()) {}
+    private readonly metrics = new OperationalMetrics()) {}
   async runOnce(now = new Date()): Promise<number> {
     const rows: { id: string; wallet_id: string; provider_id: string }[] = await this.source.query(`SELECT id,wallet_id,provider_id FROM wager_transactions
       WHERE status='PENDING_REFERENCE' AND (next_reference_attempt_at <= $1 OR reference_expires_at <= $1)

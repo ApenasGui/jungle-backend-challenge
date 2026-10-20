@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, expect, test } from 'bun:test';
+import { afterEach, beforeEach, expect, spyOn, test } from 'bun:test';
 import { FinancialService } from '../../src/application/financial-service';
 import { TypeOrmFinancialStore } from '../../src/infrastructure/database/typeorm-financial-store';
 import { SqsConsumer } from '../../src/infrastructure/messaging/sqs-consumer';
@@ -258,6 +258,39 @@ test('shutdown interrompe long polling sem esperar os 20 segundos', async () => 
   const runtime = new WorkerRuntime(db.source, queues.client, queues.config);
   runtime.start(); await Bun.sleep(50); const start = performance.now();
   await runtime.stop(); expect(performance.now() - start).toBeLessThan(5000);
+});
+
+test('runtime drena backlog sem inserir pausa entre eventos disponíveis', async () => {
+  await wallet(); await wallet();
+  const runtime = new WorkerRuntime(db.source, queues.client, queues.config);
+  const publish = runtime.publisher.publishOnce.bind(runtime.publisher);
+  let priorPause: { elapsed: boolean } | undefined;
+  const pauses: boolean[] = [];
+  const timers: ReturnType<typeof setTimeout>[] = [];
+  let published = 0; let complete!: () => void;
+  const drained = new Promise<void>(resolve => { complete = resolve; });
+  const spy = spyOn(runtime.publisher, 'publishOnce').mockImplementation(async () => {
+    if (priorPause) pauses.push(priorPause.elapsed);
+    const result = await publish();
+    if (result) {
+      const pause = { elapsed: false }; priorPause = pause;
+      timers.push(setTimeout(() => { pause.elapsed = true; }, 0));
+      if (++published === 4) complete();
+    }
+    return result;
+  });
+  let deadline: ReturnType<typeof setTimeout> | undefined;
+  try {
+    runtime.start();
+    await Promise.race([drained, new Promise<never>((_, reject) => {
+      deadline = setTimeout(() => reject(new Error('Backlog não drenado')), 10000);
+    })]);
+    expect(pauses.slice(0, 3)).toEqual([false, false, false]);
+    expect(await queues.drain(queues.config.eventsUrl)).toHaveLength(4);
+  } finally {
+    clearTimeout(deadline); await runtime.stop(); spy.mockRestore();
+    for (const timer of timers) clearTimeout(timer);
+  }
 });
 test('shutdown em mensagem em andamento conclui commit e ack', async () => {
   const owner = await wallet(); await queues.send(envelope(command(owner)));

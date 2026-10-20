@@ -1,4 +1,4 @@
-export class WorkerMetrics {
+export class OperationalMetrics {
   private readonly counters = new Map<string, number>();
   private readonly gauges = new Map<string, number>();
   constructor() {

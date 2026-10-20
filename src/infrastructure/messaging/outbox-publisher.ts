@@ -2,11 +2,11 @@ import { SendMessageCommand, type SQSClient } from '@aws-sdk/client-sqs';
 import { DataSource } from 'typeorm';
 import { OutboxSchema } from '../database/entities/financial.schemas';
 import { OutboxMessage } from '../../domain/outbox-message';
-import { WorkerMetrics } from './worker-metrics';
+import { OperationalMetrics } from '../observability/metrics';
 
 export class OutboxPublisher {
   constructor(private readonly source: DataSource, private readonly client: SQSClient,
-    private readonly queueUrl: string, private readonly metrics = new WorkerMetrics(),
+    private readonly queueUrl: string, private readonly metrics = new OperationalMetrics(),
     private readonly hooks: { afterPublish?: () => Promise<void> } = {}) {}
 
   async publishOnce(): Promise<boolean> {
