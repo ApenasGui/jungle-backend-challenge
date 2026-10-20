@@ -2,6 +2,8 @@
 
 Implementação do [desafio da Jungle Gaming](https://github.com/junglegaming/backend-challenge).
 
+Para estudar o fluxo completo, a arquitetura e as principais funções, consulte [COMO-FUNCIONA.md](COMO-FUNCIONA.md).
+
 ## Estado atual
 
 API financeira em NestJS, TypeScript estrito e TypeORM, com domínio financeiro, migrations reversíveis e testes unitários, HTTP, integração e concorrência real. Os casos de uso processam abertura, apostas, ganhos, perdas e reversões em transações PostgreSQL, com lock por wallet, idempotência persistente e eventos gravados na outbox.
