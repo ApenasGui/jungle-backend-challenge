@@ -7,7 +7,7 @@ import { Money } from '../domain/money';
 import { Wallet } from '../domain/wallet';
 import { WagerTransaction } from '../domain/wager-transaction';
 import { WalletBalanceChanged, WagerTransactionPendingReference, WagerTransactionProcessed,
-  WagerTransactionRejected, type EventContext } from './integration-events';
+  WagerTransactionRejected, WagerTransactionFailed, type EventContext } from './integration-events';
 
 export class FinancialService {
   constructor(private readonly store: FinancialStore, private readonly diagnostics: FinancialDiagnostics) {}
@@ -30,10 +30,19 @@ export class FinancialService {
     });
   }
 
-  async submit(input: unknown, keyInput: unknown, ctx: EventContext) {
+  async submit(input: unknown, keyInput: unknown, ctx: EventContext,
+    inbox?: { consumer: string; messageId: string }) {
     const payload = parseTransaction(input);
     const key = identifier(keyInput);
     const hash = hashTransactionPayload(payload);
+    const inboxHash = createHash('sha256').update(JSON.stringify({ key, hash })).digest('hex');
+    const receive = async (session: FinancialSession) => {
+      if (inbox) await session.receiveInbox(inbox.consumer, inbox.messageId, inboxHash);
+    };
+    const finish = async (session: FinancialSession, result: ReturnType<typeof replay>) => {
+      if (inbox) await session.finishInbox(inbox.consumer, inbox.messageId);
+      return result;
+    };
     // Valida o comando antes de adquirir recursos do banco.
     const props = { ...payload, id: crypto.randomUUID(), idempotencyKey: key, payloadHash: hash,
       money: Money.from(payload.money), createdAt: new Date() };
@@ -45,13 +54,14 @@ export class FinancialService {
     };
     try {
       return await this.store.transaction(async session => {
+        await receive(session);
         const prior = await session.byKey(key);
-        if (prior) return replay(prior);
+        if (prior) return finish(session, replay(prior));
         const wallet = await session.findWallet(payload.walletId, true);
         if (!wallet) throw new ApplicationError('NOT_FOUND', 'WALLET_NOT_FOUND');
         // O lock pode ter aguardado outra instância; releia a chave após adquiri-lo.
         const duplicate = await session.byKey(key) ?? await session.byExternal(payload.providerId, payload.externalTransactionId);
-        if (duplicate) return replay(duplicate);
+        if (duplicate) return finish(session, replay(duplicate));
         const tx = WagerTransaction.create(props);
         const reference = payload.referenceExternalTransactionId
           ? await session.byExternal(payload.providerId, payload.referenceExternalTransactionId) : null;
@@ -67,17 +77,72 @@ export class FinancialService {
         if (tx.status === 'PROCESSED') await session.enqueue(WagerTransactionProcessed.from(tx, ctx));
         else if (tx.status === 'REJECTED') await session.enqueue(WagerTransactionRejected.from(tx, ctx));
         else await session.enqueue(WagerTransactionPendingReference.from(tx, ctx));
-        return this.transactionResponse(tx, false);
+        return finish(session, this.transactionResponse(tx, false));
       });
     } catch (error) {
       // Chaves globais podem colidir mesmo quando as wallets são diferentes.
       if (!(error instanceof ApplicationError) || error.code !== 'CONFLICT') throw error;
       return this.store.transaction(async session => {
+        await receive(session);
         const existing = await session.byKey(key) ?? await session.byExternal(payload.providerId, payload.externalTransactionId);
-        if (existing) return replay(existing);
+        if (existing) return finish(session, replay(existing));
         throw error;
       });
     }
+  }
+
+  // Reconsulta sob o mesmo lock de wallet usado por HTTP e SQS.
+  async reprocessReference(id: string, now = new Date()) {
+    return this.store.transaction(async session => {
+      const candidate = await session.byId(id);
+      if (!candidate || candidate.status !== 'PENDING_REFERENCE') return null;
+      const wallet = await this.requireWallet(session, candidate.walletId, true);
+      const tx = await session.byId(id);
+      if (!tx || tx.status !== 'PENDING_REFERENCE') return null;
+      const schedule = await session.referenceSchedule(id);
+      if (schedule.nextAt && schedule.nextAt > now && (!schedule.expiresAt || schedule.expiresAt > now)) return null;
+      const attempts = schedule.attempts + 1;
+      const ctx = { correlationId: tx.id, causationId: tx.id };
+      if ((schedule.expiresAt && schedule.expiresAt <= now) || attempts > 100) {
+        tx.reject('REFERENCE_NOT_FOUND', now, wallet.balance);
+      } else {
+        const reference = await session.byExternal(tx.providerId, tx.referenceExternalTransactionId!);
+        const reversed = reference && tx.requiresReference() ? await session.hasReversal(reference.id) : false;
+        const entry = wallet.apply(tx, { at: now, ledgerId: crypto.randomUUID(), reference: reference ?? undefined,
+          alreadyReversed: reversed });
+        if (entry) {
+          await session.insertLedger(entry);
+          await session.updateWallet(wallet);
+          await session.enqueue(WalletBalanceChanged.from(entry, ctx));
+        }
+      }
+      // A última tentativa ainda pode resolver a referência, mas não agenda uma 101ª.
+      if (tx.status === 'PENDING_REFERENCE' && attempts >= 100) {
+        tx.reject('REFERENCE_NOT_FOUND', now, wallet.balance);
+      }
+      const next = tx.status === 'PENDING_REFERENCE'
+        ? new Date(now.getTime() + Math.min(1000 * 2 ** Math.min(attempts, 20), 15 * 60 * 1000)) : null;
+      await session.updateTransaction(tx, attempts, next, schedule.expiresAt);
+      const finalStatus = tx.snapshot().status;
+      if (finalStatus === 'PROCESSED') await session.enqueue(WagerTransactionProcessed.from(tx, ctx));
+      if (finalStatus === 'REJECTED') await session.enqueue(WagerTransactionRejected.from(tx, ctx));
+      return this.transactionResponse(tx, false);
+    });
+  }
+
+  // Após esgotar retries, registra falha sem sobrescrever qualquer resultado já confirmado.
+  async auditDeliveryFailure(input: unknown, keyInput: unknown, ctx: EventContext): Promise<boolean> {
+    const payload = parseTransaction(input); const key = identifier(keyInput);
+    return this.store.transaction(async session => {
+      await this.requireWallet(session, payload.walletId, true);
+      if (await session.byKey(key) || await session.byExternal(payload.providerId, payload.externalTransactionId)) return false;
+      const tx = WagerTransaction.create({ ...payload, id: crypto.randomUUID(), idempotencyKey: key,
+        payloadHash: hashTransactionPayload(payload), money: Money.from(payload.money), createdAt: new Date() });
+      tx.fail('INFRASTRUCTURE_FAILURE', new Date());
+      await session.insertTransaction(tx);
+      await session.enqueue(WagerTransactionFailed.from(tx, ctx));
+      return true;
+    });
   }
 
   async getWallet(idInput: unknown) {

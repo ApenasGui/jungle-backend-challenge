@@ -2,7 +2,7 @@
 
 ## Estado atual e organização
 
-O domínio financeiro, os mapeamentos TypeORM, a migration e a API financeira estão implementados. Casos de uso dependem da porta `FinancialStore`, sem importar NestJS ou TypeORM. O adaptador fornece uma sessão com o mesmo `EntityManager` para cada transação. A migration foi aplicada no PostgreSQL 17.6 e validada com rollback/reaplicação. Workers SQS, publicação da outbox, readiness e observabilidade completa continuam pendentes.
+O domínio financeiro, os mapeamentos TypeORM, a migration, a API financeira e os workers estão implementados. Casos de uso dependem da porta `FinancialStore`, sem importar NestJS ou TypeORM. O adaptador fornece uma sessão com o mesmo `EntityManager` para cada transação. A migration foi aplicada no PostgreSQL 17.6 e validada com rollback/reaplicação. Readiness, métricas Prometheus e logs JSON correlacionados estão implementados.
 
 NestJS organiza HTTP e injeção de dependências. Bun 1.4.3 executa aplicação, instalação e testes; TypeScript verifica tipos e compila o código. TypeORM foi escolhido por familiaridade do candidato. Usamos `EntitySchema` para manter o domínio sem decorators ou dependências do ORM. Mappers explícitos reconstroem as classes pelas factories `rehydrate`, sem reaplicar transições.
 
@@ -54,15 +54,27 @@ A cadeia validada em cada inserção permite consultar o último lançamento por
 
 ## Estratégia transacional
 
-O caso de uso adquire `SELECT ... FOR UPDATE` na wallet antes de calcular o saldo, em `READ COMMITTED`. Wallets diferentes podem prosseguir em paralelo. Transação, wallet, ledger e outbox usam o mesmo `EntityManager` transacional. A inbox será integrada quando houver entrada SQS. Eventos são gravados na outbox; ainda não há publisher.
+O caso de uso adquire `SELECT ... FOR UPDATE` na wallet antes de calcular o saldo, em `READ COMMITTED`. Wallets diferentes podem prosseguir em paralelo. Inbox, transação, wallet, ledger e outbox usam o mesmo `EntityManager` transacional. O consumidor SQS chama o mesmo caso de uso da API e confirma a mensagem somente após o commit.
 
 Constraints únicas garantem idempotência entre processos. Uma colisão global de chave pode ocorrer entre wallets diferentes; a transação perdedora é revertida e o caso de uso busca o resultado persistido para comparar o hash. Resolução de referência e verificação de reversão ocorrem sob o lock da wallet.
 
 O adaptador limita espera por lock a 3 segundos e cada comando SQL a 10 segundos. Repete até duas vezes após deadlock, falha de serialização ou timeout de lock, sempre abrindo nova transação e recarregando o estado. Não repete automaticamente falha de conexão com resultado de commit incerto: responde `503`, permitindo que o cliente consulte ou repita a mesma chave com segurança.
 
-O schema reserva inbox com chave `(consumerName, messageId)` e outbox com índice de publicação pendente. Os quatro eventos exigidos possuem subclasses concretas de um envelope abstrato com ID, versão, correlação e valores monetários serializados. Abertura positiva emite evento de transação processada e de saldo alterado; `LOSS` e rejeições não emitem mudança de saldo. Replay não emite novos eventos.
+O schema mantém inbox com chave `(consumerName, messageId)` e outbox com índice de publicação pendente. Os eventos possuem subclasses concretas de um envelope abstrato com ID, versão, correlação e valores monetários serializados. Abertura positiva emite evento de transação processada e de saldo alterado; `LOSS` e rejeições não emitem mudança de saldo. Replay não emite novos eventos.
 
-Referências ausentes recebem agendamento inicial em 1 segundo e expiração em 24 horas. Esses campos preparam o worker futuro; ainda não há reprocessamento nem aplicação automática do TTL. O Compose configura filas FIFO de entrada, DLQ e saída; deduplicação do broker será uma otimização, não a garantia financeira.
+Referências ausentes recebem agendamento inicial em 1 segundo e expiração em 24 horas. O worker busca lotes de 20 e revalida estado e agendamento sob lock da wallet. O backoff cresce exponencialmente até 15 minutos. Na centésima tentativa ainda sem referência, ou na expiração, a transação é rejeitada com `REFERENCE_NOT_FOUND`. Duas instâncias podem buscar a mesma candidata, mas apenas uma aplica a transição. O Compose configura filas FIFO de entrada, DLQ e saída; a deduplicação do broker é uma otimização, não a garantia financeira.
+
+## Mensageria e recuperação
+
+A inbox trava sua identidade e compara o hash do payload financeiro mais a chave de idempotência. Metadados de transporte não alteram esse hash. Redelivery após commit encontra o resultado persistido e não repete ledger nem eventos. Se qualquer escrita falhar, a inbox também é revertida.
+
+O consumidor usa long polling de 20 segundos e renova a visibilidade durante o processamento. Falhas transitórias aguardam backoff exponencial, limitado a 300 segundos, até cinco recebimentos. Payload inválido ou conflito segue diretamente para a DLQ. A mensagem original só é removida depois da confirmação do envio à DLQ; uma falha nesse envio preserva a possibilidade de redelivery. Rejeições comerciais recebem ack normal.
+
+Ao esgotar retries de infraestrutura, o consumidor tenta registrar `FAILED` e `WagerTransactionFailed`, sem alterar saldo nem sobrescrever resultado existente. Se o banco continuar indisponível, essa auditoria SQL não pode ser garantida: a mensagem preservada na DLQ é o registro durável para investigação e reprocessamento operacional. Não há redrive automático da DLQ.
+
+Cada publisher reserva uma linha da outbox com `FOR UPDATE SKIP LOCKED` e `LIMIT 1`, envia o evento e marca a publicação na mesma transação SQL. Falha de envio persiste tentativas e backoff até 60 segundos. Uma queda após envio e antes do commit pode repetir o evento; `eventId` permanece estável e deve ser deduplicado pelo consumidor. O FIFO usa wallet como grupo, mas publishers concorrentes não garantem ordem global de publicação; consumidores devem considerar a versão financeira dos eventos de saldo.
+
+`SIGINT` e `SIGTERM` interrompem novos recebimentos e aguardam o trabalho em andamento antes de fechar conexões. Os workers expõem métricas por processo na porta 3001 e logs JSON com identificadores, sem payload financeiro. Os testes encerram processos reais nos intervalos commit/ack e envio/marcação e verificam recuperação por outra instância.
 
 ## Hash de payload
 
@@ -79,7 +91,7 @@ SHA-256 de JSON canônico com chaves ordenadas recursivamente. Inclui apenas `pr
 | `INSUFFICIENT_FUNDS` | Aposta sem saldo |
 | `REVERSAL_INSUFFICIENT_FUNDS` | Reversão produziria saldo negativo |
 | `WALLET_MISMATCH` | Wallet ou jogador incompatíveis |
-| `REFERENCE_NOT_FOUND` | Referência não resolvida até o futuro limite de tentativas/TTL |
+| `REFERENCE_NOT_FOUND` | Referência não resolvida até o limite de tentativas/TTL |
 | `REFERENCE_NOT_PROCESSED` | Referência concluída sem sucesso |
 | `REFERENCE_MISMATCH` | Identidade da referência divergente |
 | `INVALID_REFERENCE_KIND` | Tipo de referência inválido |
@@ -89,7 +101,7 @@ SHA-256 de JSON canônico com chaves ordenadas recursivamente. Inclui apenas `pr
 | `INFRASTRUCTURE_FAILURE` | Falha permanente de infraestrutura |
 | `INVALID_TRANSACTION_STATE`, `INVALID_LEDGER` | Violação interna de transição ou lançamento |
 
-O mapeamento HTTP separa `400` (entrada inválida), `404` (recurso ausente), `409` (conflito), `422` (rejeição de negócio), `202` (pendente), `503` (falha transitória) e `500` (erro interno). Consultas bem-sucedidas retornam `200`, mesmo quando o estado consultado é rejeitado. Os contratos são validados no caso de uso para que a futura fila utilize as mesmas regras. Erros internos não expõem SQL nem payloads financeiros.
+O mapeamento HTTP separa `400` (entrada inválida), `404` (recurso ausente), `409` (conflito), `422` (rejeição de negócio), `202` (pendente), `503` (falha transitória) e `500` (erro interno). Consultas bem-sucedidas retornam `200`, mesmo quando o estado consultado é rejeitado. Os contratos são validados no caso de uso para que HTTP e fila utilizem as mesmas regras. Erros internos não expõem SQL nem payloads financeiros.
 
 O ledger usa cursor opaco contendo wallet e versão. A versão é imutável e estritamente crescente, evitando problemas com timestamps iguais ou precisão de datas. Limite de página: 1 a 100. O cursor não é uma credencial de autorização.
 
@@ -97,14 +109,36 @@ O ledger usa cursor opaco contendo wallet e versão. A versão é imutável e es
 
 Os testes unitários verificam dinheiro, operações, rejeições, referências, estados terminais, hash, snapshots e mapeamentos. A validação de metadados TypeORM não abre conexão. O teste sequencial de duas apostas verifica a regra de saldo, mas não comprova concorrência real.
 
-Os 63 testes de integração/HTTP usam PostgreSQL 17.6 e LocalStack 4.7.0 reais. Verificam migrations, constraints, ledger, referências, unicidade da inbox, atomicidade SQL, contratos, replay, paginação e erros. Uma falha injetada na inserção da outbox confirma que o endpoint não deixa débito parcial. Depois de cada teste financeiro, a suíte reconstrói o saldo somando o ledger. Cada execução cria e remove seu próprio banco. O teste de SQS verifica apenas existência das filas, FIFO e política de DLQ.
+Os 98 testes de integração/HTTP/mensageria/observabilidade usam PostgreSQL 17.6 e LocalStack 4.7.0 reais. Verificam migrations, constraints, ledger, referências, unicidade da inbox, atomicidade SQL, contratos, replay, paginação e erros. Uma falha injetada na inserção da outbox confirma que o endpoint não deixa débito parcial. Depois de cada teste financeiro, a suíte reconstrói o saldo somando o ledger. Cada execução cria e remove seu próprio banco. A mensageria usa filas temporárias e cobre retry, DLQ, publishers concorrentes, TTL, falhas de processos e shutdown.
 
 A execução real identificou e corrigiu uma expressão `CASE` que precisava de parênteses dentro do `IF` de um trigger. Também confirmou que `Infinity` falha no próprio `NUMERIC(20,2)` com SQLSTATE `22003`, enquanto `NaN` é recusado pelo check com `23514`.
 
 Cinco testes de concorrência iniciam três processos reais: 50 duplicatas causam um débito; duas apostas de 80 disputam saldo 100; chave global entre wallets não duplica efeitos; um lock não bloqueia outra wallet; replay permanece seguro após reiniciar um processo. Os processos são encerrados e o banco temporário é removido.
 
-Faltam processamento SQS, publishers concorrentes, reprocessamento de referências e seus testes de retry, DLQ e falhas após commit/antes do ack. Readiness, logs de processamento completos, métricas adicionais e shutdown dos workers também estão pendentes. Os logs de bootstrap já usam JSON e a reconciliação possui uma métrica Prometheus, mas isso ainda não cobre toda a observabilidade exigida.
+A validação de observabilidade cobre readiness com banco indisponível e fila ausente, liveness independente das dependências, correlação de logs e eventos, ausência de valores financeiros nos logs, backlog da outbox e conflitos reais de lock.
+
+## Observabilidade e limites operacionais
+
+Na branch `refactor/otimizacao`, o agendamento da outbox passou a esperar 250 ms somente quando não encontra evento devido. Enquanto houver trabalho, inicia a próxima publicação após concluir a anterior; cada evento mantém sua transação e o lock `SKIP LOCKED`. Falhas de envio continuam usando o backoff persistido, e falhas do loop aguardam 1 segundo. O shutdown é verificado entre publicações. A espera fixa por evento foi removida, mas não foi feito benchmark de throughput.
+
+Os diagnósticos compartilhados ficam em `infrastructure/observability`, sem dependência de NestJS. O controller `/metrics` permanece na camada HTTP. O worker usa uma única instância dos diagnósticos para métricas de processamento, conflitos de lock e reconciliação.
+
+Testes de integração confirmam que 20 scrapes concorrentes executam apenas as duas consultas de agregação, que o cache expira, e que falhas removem gauges antes da recuperação. Outro teste confirma que o runtime inicia a próxima publicação sem uma espera de timer entre eventos disponíveis. As garantias financeiras continuam cobertas pelas suítes de concorrência e recuperação.
+
+API e worker expõem liveness e readiness separadamente. Readiness faz `SELECT 1` em conexão dedicada, com timeout de conexão e consulta de 2 segundos, e consulta atributos das três filas em paralelo, com timeout de 2 segundos por chamada. Não publica nem recebe mensagens. Durante shutdown, a aplicação deixa de indicar que aceita trabalho. Uma falha de dependência retorna apenas flags, sem credenciais ou mensagens internas.
+
+Logs HTTP registram rota, status, duração e identificadores disponíveis. O `correlationId` é validado, devolvido no header e reutilizado pelos eventos. Logs SQS adicionam `messageId`; um request HTTP não tem esse identificador. Os logs omitem headers de autorização, chave de idempotência, corpos, saldos e valores. Health e scrape de métricas não geram logs de processamento.
+
+Métricas de resultados e retries são contadores locais e podem perder uma atualização se o processo morrer imediatamente após o commit. Por isso, também expomos gauges de transações por estado consultando o PostgreSQL, incluindo `OPENING`. Replays contam como duplicatas e não como novos resultados. Uma referência pode passar por pendência e depois por estado terminal: os contadores de resultados não representam transações únicas. A latência usa histograma com buckets entre 10 ms e 15 s, além de `+Inf`.
+
+Outbox lag mede a idade do evento pendente mais antigo, inclusive durante backoff, e zera quando a fila SQL esvazia. Contadores de envio à DLQ medem encaminhamentos confirmados pelo processo, não o tamanho atual da fila. Conflitos de lock incluem SQLSTATE `40P01` e `55P03`; tentativas de serialização também entram em retries. Os gauges compartilhados não devem ser somados entre réplicas.
+
+As coletas SQL de métricas têm cache local de cinco segundos, contado após o fim da coleta. Scrapes concorrentes compartilham a mesma Promise e não multiplicam consultas. Falhas também respeitam o intervalo, evitando retries contínuos em scrapes sucessivos. Contadores e histogramas são renderizados novamente em toda resposta; readiness não usa esse cache. O cache é exclusivo de observabilidade e não participa da idempotência nem das decisões financeiras. As coletas usam o pool com timeout de conexão de 5 segundos e statement timeout de 10 segundos. Uma coleta falha remove seus gauges e sinaliza `collection_success=0`, evitando expor zero como se fosse um resultado válido. A contagem por estado faz agregação sobre o histórico: para volumes grandes, mesmo com cache curto, precisaria de agregação dedicada ou coleta em um único processo. Um scrape por instância a cada 15–30 segundos é suficiente para o ambiente de demonstração.
+
+Não foram adicionados dashboard, tracing distribuído, teste de carga ou IdP. A entrega usa PostgreSQL e LocalStack locais; não foi validada em uma conta AWS real. O publisher mantém uma transação SQL aberta durante o envio, limitado a 5 segundos: isso simplifica a reserva e recuperação, com custo de conexão ocupada. Uma evolução para alto volume pode usar leases persistidos, mantendo entrega pelo menos uma vez e deduplicação por `eventId`.
 
 ## Autenticação
 
-A proposta é adiar a integração com IdP e documentar o ponto de extensão, priorizando os requisitos financeiros. Essa decisão ainda deve ser confirmada com o candidato; nenhum mecanismo de autenticação foi implementado nesta etapa.
+A integração com IdP foi deixada fora do escopo para priorizar correção financeira e recuperação distribuída dentro do prazo. O ProviderAuthGuard está aplicado ao controller financeiro e libera o acesso explicitamente; ele é um ponto de extensão, não uma proteção de segurança. Health permanece público e SQS é tratado como canal interno.
+
+Em uma implantação autenticada, o guard validaria assinatura via JWKS, issuer, audience e expiração de um access token emitido por Keycloak ou outro IdP OIDC. Uma política de autorização associaria o principal ao providerId permitido e ao escopo de wallets, incluindo consultas e criação. O providerId informado no body não seria prova de identidade. Nenhuma tabela de senhas ou autenticação artesanal seria adicionada.

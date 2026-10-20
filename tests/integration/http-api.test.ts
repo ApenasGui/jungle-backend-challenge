@@ -36,6 +36,14 @@ afterEach(async () => {
 });
 
 describe('API financeira com PostgreSQL real', () => {
+  test('corpo acima do limite retorna 413 sem criar transação', async () => {
+    const before = await database.source.getRepository(TransactionSchema).count();
+    const response = await fetch(`${base}/wagering/transactions`, { method: 'POST',
+      headers: { 'content-type': 'application/json' }, body: JSON.stringify({ padding: 'x'.repeat(110000) }) });
+    expect(response.status).toBe(413);
+    expect(await response.json()).toEqual({ statusCode: 413, code: 'PAYLOAD_TOO_LARGE' });
+    expect(await database.source.getRepository(TransactionSchema).count()).toBe(before);
+  });
   test('cria, consulta e reconcilia wallet com abertura auditável', async () => {
     const owner = await wallet();
     const result = await request(`/wallets/${owner.id}`);

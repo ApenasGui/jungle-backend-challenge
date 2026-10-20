@@ -7,7 +7,9 @@ export class ApiExceptionFilter implements ExceptionFilter {
   // Erros de SQL e payloads financeiros nunca são expostos na resposta ou nos logs.
   catch(error: unknown, host: ArgumentsHost): void {
     let status = 500; let code = 'INTERNAL_ERROR';
-    if (error instanceof ApplicationError) {
+    if (error instanceof Error && 'type' in error && error.type === 'entity.too.large') {
+      status = 413; code = 'PAYLOAD_TOO_LARGE';
+    } else if (error instanceof ApplicationError) {
       status = { INVALID_PAYLOAD: 400, NOT_FOUND: 404, CONFLICT: 409, SERVICE_UNAVAILABLE: 503 }[error.code];
       code = error.message;
     } else if (error instanceof DomainError) {
@@ -18,7 +20,8 @@ export class ApiExceptionFilter implements ExceptionFilter {
       status = error.getStatus();
       code = status === 404 ? 'NOT_FOUND' : status === 400 ? 'INVALID_PAYLOAD' : 'HTTP_ERROR';
     }
-    if (status >= 500) console.error(JSON.stringify({ level: 'error', event: 'http_error', code, status }));
+    if (status >= 500) console.error(JSON.stringify({ level: 'error', event: 'http_error', code, status,
+      correlationId: host.switchToHttp().getRequest().headers['x-correlation-id'] }));
     const response = host.switchToHttp().getResponse();
     if (status === 503) response.setHeader('Retry-After', '1');
     response.status(status).json({ statusCode: status, code });

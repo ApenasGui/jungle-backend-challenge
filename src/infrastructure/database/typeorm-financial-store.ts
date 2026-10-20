@@ -5,7 +5,9 @@ import type { IntegrationEvent } from '../../application/integration-events';
 import { Wallet } from '../../domain/wallet';
 import { WagerTransaction } from '../../domain/wager-transaction';
 import { WalletLedgerEntry } from '../../domain/wallet-ledger-entry';
-import { LedgerSchema, OutboxSchema, TransactionSchema, WalletSchema } from './entities/financial.schemas';
+import { InboxMessage } from '../../domain/inbox-message';
+import { OutboxMessage } from '../../domain/outbox-message';
+import { InboxSchema, LedgerSchema, OutboxSchema, TransactionSchema, WalletSchema } from './entities/financial.schemas';
 import { ledgerFromRow, ledgerToRow, transactionFromRow, transactionToRow, walletFromRow, walletToRow } from './financial-mappers';
 
 function sqlCode(error: unknown): string | undefined {
@@ -14,7 +16,8 @@ function sqlCode(error: unknown): string | undefined {
 }
 
 export class TypeOrmFinancialStore implements FinancialStore {
-  constructor(private readonly source: DataSource) {}
+  constructor(private readonly source: DataSource,
+    private readonly diagnostics?: { lockConflict(): void; retry(): void }) {}
 
   // Só repete transações abortadas pelo PostgreSQL; resultado de commit incerto não é repetido aqui.
   async transaction<T>(work: (session: FinancialSession) => Promise<T>): Promise<T> {
@@ -28,7 +31,9 @@ export class TypeOrmFinancialStore implements FinancialStore {
         });
       } catch (error) {
         const code = sqlCode(error);
+        if (['40P01', '55P03'].includes(code ?? '')) this.diagnostics?.lockConflict();
         if (['40001', '40P01', '55P03'].includes(code ?? '') && attempt < 2) {
+          this.diagnostics?.retry();
           await Bun.sleep(20 * (attempt + 1));
           continue;
         }
@@ -48,6 +53,25 @@ export class TypeOrmFinancialStore implements FinancialStore {
 
 class TypeOrmFinancialSession implements FinancialSession {
   constructor(private readonly manager: EntityManager) {}
+  async receiveInbox(consumer: string, messageId: string, hash: string) {
+    await this.manager.query(`INSERT INTO inbox_messages (consumer_name, message_id, payload_hash, received_at)
+      VALUES ($1,$2,$3,now()) ON CONFLICT (consumer_name,message_id) DO NOTHING`, [consumer, messageId, hash]);
+    const row = await this.manager.findOneOrFail(InboxSchema, { where: { consumerName: consumer, messageId },
+      lock: { mode: 'pessimistic_write' } });
+    if (!InboxMessage.rehydrate(row).matches(hash)) throw new ApplicationError('CONFLICT', 'INBOX_PAYLOAD_CONFLICT');
+  }
+  async finishInbox(consumer: string, messageId: string) {
+    await this.manager.query(`UPDATE inbox_messages SET processed_at=COALESCE(processed_at,now())
+      WHERE consumer_name=$1 AND message_id=$2`, [consumer, messageId]);
+  }
+  async referenceSchedule(id: string) {
+    const row = await this.manager.findOneByOrFail(TransactionSchema, { id });
+    return { attempts: row.referenceAttempts, nextAt: row.nextReferenceAttemptAt, expiresAt: row.referenceExpiresAt };
+  }
+  async updateTransaction(tx: WagerTransaction, attempts: number, nextAt: Date | null, expiresAt: Date | null) {
+    const row = transactionToRow(tx, { referenceAttempts: attempts, nextReferenceAttemptAt: nextAt, referenceExpiresAt: expiresAt });
+    await this.manager.update(TransactionSchema, tx.id, row);
+  }
   async findWallet(id: string, lock = false) {
     const row = await this.manager.findOne(WalletSchema, { where: { id },
       lock: lock ? { mode: 'pessimistic_write' } : undefined });
@@ -81,9 +105,7 @@ class TypeOrmFinancialSession implements FinancialSession {
   }
   async insertLedger(entry: WalletLedgerEntry) { await this.manager.insert(LedgerSchema, ledgerToRow(entry)); }
   async enqueue(event: IntegrationEvent) {
-    await this.manager.save(OutboxSchema, { id: event.eventId, aggregateId: event.aggregateId,
-      eventType: event.eventType, payload: event.toJSON(), occurredAt: event.occurredAt,
-      attempts: 0, nextAttemptAt: event.occurredAt, publishedAt: null });
+    await this.manager.save(OutboxSchema, OutboxMessage.enqueue(event).snapshot());
   }
   async ledger(walletId: string, version: number, limit: number) {
     const rows = await this.manager.find(LedgerSchema, { where: { walletId, walletVersion: MoreThan(version) },
