@@ -6,7 +6,7 @@ Implementação do [desafio da Jungle Gaming](https://github.com/junglegaming/ba
 
 API financeira em NestJS, TypeScript estrito e TypeORM, com domínio financeiro, migrations reversíveis e testes unitários, HTTP, integração e concorrência real. Os casos de uso processam abertura, apostas, ganhos, perdas e reversões em transações PostgreSQL, com lock por wallet, idempotência persistente e eventos gravados na outbox.
 
-Ainda faltam consumidores SQS, publicação da outbox, worker de referências pendentes, readiness e observabilidade completa. Os eventos permanecem na outbox sem publicação. Transações `PENDING_REFERENCE` são aceitas e consultáveis, mas ainda não são reprocessadas automaticamente. Os endpoints estão sem autenticação nesta etapa.
+O worker SQS compartilha o caso de uso da API, persiste a inbox, publica a outbox e reprocessa referências pendentes. Inclui retry, DLQ e encerramento gracioso. Ainda faltam readiness e observabilidade completa. Os endpoints estão sem autenticação nesta etapa.
 
 ## Requisitos
 
@@ -25,6 +25,8 @@ bun run dev
 
 O Bun carrega `.env` automaticamente. As credenciais do exemplo são exclusivas para desenvolvimento local.
 
+Em outro terminal, na mesma pasta, execute `bun run worker`. Ele consome a fila de entrada, publica eventos e resolve referências pendentes. Expõe `/health/live` e `/metrics` na porta `3001`, configurável por `WORKER_PORT`.
+
 ## Comandos
 
 ```sh
@@ -35,6 +37,8 @@ bun run test:integration # Testa PostgreSQL e configuração SQS locais reais.
 bun run test:concurrency # Inicia três processos HTTP e testa disputas reais.
 bun run dev            # Executa a API com reinício ao editar arquivos.
 bun run start:prod     # Executa o código compilado.
+bun run worker         # Executa consumidor, publisher e worker de referências.
+bun run worker:prod    # Executa os workers compilados.
 bun run infra:up       # Inicia PostgreSQL e LocalStack e aguarda saúde.
 bun run infra:down     # Para os containers, preservando o volume do banco.
 ```
@@ -54,9 +58,37 @@ bun run test:integration
 
 A suíte cria bancos exclusivos `wagering_test_<uuid>` e os remove ao terminar; não limpa nem reverte o banco de desenvolvimento. `TEST_DATABASE_ADMIN_URL` deve apontar para PostgreSQL local com permissão de criar bancos. Os testes de banco aplicam suas próprias migrations e não dependem da aplicação prévia em `wagering`. Uma interrupção forçada do processo pode deixar um banco temporário para limpeza manual.
 
-São 85 testes unitários, 63 de integração/HTTP e 5 de concorrência. Os testes reais cobrem persistência decimal, unicidade, imutabilidade, cadeia do ledger, reversões, rollback antes e durante o commit e configuração FIFO/DLQ do LocalStack. Também verificam contratos HTTP, replay, paginação, indisponibilidade e falha de gravação da outbox. Após cada teste financeiro, o saldo é comparado com a soma do ledger. O teste SQS apenas consulta as filas; não consome mensagens existentes. `bun test` executa todas as suítes e exige os containers ativos.
+São 85 testes unitários, 84 de integração/HTTP/mensageria e 5 de concorrência. Os testes reais cobrem persistência decimal, unicidade, imutabilidade, cadeia do ledger, reversões, rollback antes e durante o commit e configuração FIFO/DLQ do LocalStack. Também verificam contratos HTTP, replay, paginação, indisponibilidade e falha de gravação da outbox. Após cada teste financeiro, o saldo é comparado com a soma do ledger. Os testes de mensageria criam e removem filas próprias; não consomem as filas de desenvolvimento. `bun test --timeout 30000` executa todas as suítes e exige os containers ativos.
 
-A suíte de concorrência inicia três processos reais da API em portas aleatórias: envia 50 duplicatas, disputa saldo, testa chaves globais entre wallets e verifica independência dos locks. Também reinicia um processo e confirma replay persistente. Ela encerra os processos e remove o banco temporário ao terminar. Ainda faltam os cenários de falha e recuperação dos workers SQS e publishers.
+A suíte de concorrência inicia três processos reais da API em portas aleatórias: envia 50 duplicatas, disputa saldo, testa chaves globais entre wallets e verifica independência dos locks. Também reinicia um processo e confirma replay persistente. A suíte de mensageria encerra processos reais após commit/antes do ack e após envio/antes de marcar a outbox, verificando a recuperação. Inclui publishers concorrentes, retry, DLQ, TTL e shutdown. Os processos, bancos e filas temporários são removidos ao terminar.
+
+## Entrada SQS
+
+Envie à fila `wager-transactions.fifo` um envelope como abaixo, usando os IDs de uma wallet existente. Defina `MessageGroupId` como o `walletId` e um `MessageDeduplicationId` no envio.
+
+```json
+{
+  "messageId": "request-001",
+  "type": "WagerTransactionRequested",
+  "occurredAt": "2026-10-19T12:00:00.000Z",
+  "correlationId": "correlation-001",
+  "data": {
+    "idempotencyKey": "provider-a:bet-001",
+    "providerId": "provider-a",
+    "externalTransactionId": "bet-001",
+    "walletId": "00000000-0000-4000-8000-000000000001",
+    "playerId": "00000000-0000-4000-8000-000000000002",
+    "roundId": "round-1",
+    "gameId": "game-1",
+    "kind": "BET",
+    "money": { "amount": "25.00", "currency": "BRL" }
+  }
+}
+```
+
+O ack ocorre depois do commit. Rejeições de negócio também recebem ack; mensagens inválidas ou conflitantes seguem para a DLQ. Falhas transitórias têm backoff e até cinco recebimentos antes da DLQ. O banco garante idempotência mesmo quando a deduplicação FIFO não se aplica.
+
+A outbox usa entrega pelo menos uma vez: consumidores dos eventos devem deduplicar por `eventId`. Referências pendentes são reavaliadas com backoff, até 100 tentativas ou 24 horas; ao esgotar o limite, são rejeitadas com `REFERENCE_NOT_FOUND`. Consulte `ARCHITECTURE.md` para os detalhes de recuperação.
 
 ## API HTTP
 

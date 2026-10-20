@@ -35,6 +35,12 @@ export class WagerTransactionRejected extends IntegrationEvent {
     return new WagerTransactionRejected(tx.walletId, tx.processedAt!, transactionData(tx), ctx);
   }
 }
+export class WagerTransactionFailed extends IntegrationEvent {
+  readonly eventType = 'WagerTransactionFailed';
+  static from(tx: WagerTransaction, ctx: EventContext): WagerTransactionFailed {
+    return new WagerTransactionFailed(tx.walletId, tx.processedAt!, transactionData(tx), ctx);
+  }
+}
 export class WagerTransactionPendingReference extends IntegrationEvent {
   readonly eventType = 'WagerTransactionPendingReference';
   static from(tx: WagerTransaction, ctx: EventContext): WagerTransactionPendingReference {

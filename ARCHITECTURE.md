@@ -2,7 +2,7 @@
 
 ## Estado atual e organização
 
-O domínio financeiro, os mapeamentos TypeORM, a migration e a API financeira estão implementados. Casos de uso dependem da porta `FinancialStore`, sem importar NestJS ou TypeORM. O adaptador fornece uma sessão com o mesmo `EntityManager` para cada transação. A migration foi aplicada no PostgreSQL 17.6 e validada com rollback/reaplicação. Workers SQS, publicação da outbox, readiness e observabilidade completa continuam pendentes.
+O domínio financeiro, os mapeamentos TypeORM, a migration, a API financeira e os workers estão implementados. Casos de uso dependem da porta `FinancialStore`, sem importar NestJS ou TypeORM. O adaptador fornece uma sessão com o mesmo `EntityManager` para cada transação. A migration foi aplicada no PostgreSQL 17.6 e validada com rollback/reaplicação. Readiness e observabilidade completa continuam pendentes.
 
 NestJS organiza HTTP e injeção de dependências. Bun 1.4.3 executa aplicação, instalação e testes; TypeScript verifica tipos e compila o código. TypeORM foi escolhido por familiaridade do candidato. Usamos `EntitySchema` para manter o domínio sem decorators ou dependências do ORM. Mappers explícitos reconstroem as classes pelas factories `rehydrate`, sem reaplicar transições.
 
@@ -54,15 +54,27 @@ A cadeia validada em cada inserção permite consultar o último lançamento por
 
 ## Estratégia transacional
 
-O caso de uso adquire `SELECT ... FOR UPDATE` na wallet antes de calcular o saldo, em `READ COMMITTED`. Wallets diferentes podem prosseguir em paralelo. Transação, wallet, ledger e outbox usam o mesmo `EntityManager` transacional. A inbox será integrada quando houver entrada SQS. Eventos são gravados na outbox; ainda não há publisher.
+O caso de uso adquire `SELECT ... FOR UPDATE` na wallet antes de calcular o saldo, em `READ COMMITTED`. Wallets diferentes podem prosseguir em paralelo. Inbox, transação, wallet, ledger e outbox usam o mesmo `EntityManager` transacional. O consumidor SQS chama o mesmo caso de uso da API e confirma a mensagem somente após o commit.
 
 Constraints únicas garantem idempotência entre processos. Uma colisão global de chave pode ocorrer entre wallets diferentes; a transação perdedora é revertida e o caso de uso busca o resultado persistido para comparar o hash. Resolução de referência e verificação de reversão ocorrem sob o lock da wallet.
 
 O adaptador limita espera por lock a 3 segundos e cada comando SQL a 10 segundos. Repete até duas vezes após deadlock, falha de serialização ou timeout de lock, sempre abrindo nova transação e recarregando o estado. Não repete automaticamente falha de conexão com resultado de commit incerto: responde `503`, permitindo que o cliente consulte ou repita a mesma chave com segurança.
 
-O schema reserva inbox com chave `(consumerName, messageId)` e outbox com índice de publicação pendente. Os quatro eventos exigidos possuem subclasses concretas de um envelope abstrato com ID, versão, correlação e valores monetários serializados. Abertura positiva emite evento de transação processada e de saldo alterado; `LOSS` e rejeições não emitem mudança de saldo. Replay não emite novos eventos.
+O schema mantém inbox com chave `(consumerName, messageId)` e outbox com índice de publicação pendente. Os eventos possuem subclasses concretas de um envelope abstrato com ID, versão, correlação e valores monetários serializados. Abertura positiva emite evento de transação processada e de saldo alterado; `LOSS` e rejeições não emitem mudança de saldo. Replay não emite novos eventos.
 
-Referências ausentes recebem agendamento inicial em 1 segundo e expiração em 24 horas. Esses campos preparam o worker futuro; ainda não há reprocessamento nem aplicação automática do TTL. O Compose configura filas FIFO de entrada, DLQ e saída; deduplicação do broker será uma otimização, não a garantia financeira.
+Referências ausentes recebem agendamento inicial em 1 segundo e expiração em 24 horas. O worker busca lotes de 20 e revalida estado e agendamento sob lock da wallet. O backoff cresce exponencialmente até 15 minutos. Após 100 tentativas ou expiração, a transação é rejeitada com `REFERENCE_NOT_FOUND`. Duas instâncias podem buscar a mesma candidata, mas apenas uma aplica a transição. O Compose configura filas FIFO de entrada, DLQ e saída; a deduplicação do broker é uma otimização, não a garantia financeira.
+
+## Mensageria e recuperação
+
+A inbox trava sua identidade e compara o hash do payload financeiro mais a chave de idempotência. Metadados de transporte não alteram esse hash. Redelivery após commit encontra o resultado persistido e não repete ledger nem eventos. Se qualquer escrita falhar, a inbox também é revertida.
+
+O consumidor usa long polling de 20 segundos e renova a visibilidade durante o processamento. Falhas transitórias aguardam backoff exponencial, limitado a 300 segundos, até cinco recebimentos. Payload inválido ou conflito segue diretamente para a DLQ. A mensagem original só é removida depois da confirmação do envio à DLQ; uma falha nesse envio preserva a possibilidade de redelivery. Rejeições comerciais recebem ack normal.
+
+Ao esgotar retries de infraestrutura, o consumidor tenta registrar `FAILED` e `WagerTransactionFailed`, sem alterar saldo nem sobrescrever resultado existente. Se o banco continuar indisponível, essa auditoria SQL não pode ser garantida: a mensagem preservada na DLQ é o registro durável para investigação e reprocessamento operacional. Não há redrive automático da DLQ.
+
+Cada publisher reserva uma linha da outbox com `FOR UPDATE SKIP LOCKED` e `LIMIT 1`, envia o evento e marca a publicação na mesma transação SQL. Falha de envio persiste tentativas e backoff até 60 segundos. Uma queda após envio e antes do commit pode repetir o evento; `eventId` permanece estável e deve ser deduplicado pelo consumidor. O FIFO usa wallet como grupo, mas publishers concorrentes não garantem ordem global de publicação; consumidores devem considerar a versão financeira dos eventos de saldo.
+
+`SIGINT` e `SIGTERM` interrompem novos recebimentos e aguardam o trabalho em andamento antes de fechar conexões. Os workers expõem métricas por processo na porta 3001 e logs JSON com identificadores, sem payload financeiro. Os testes encerram processos reais nos intervalos commit/ack e envio/marcação e verificam recuperação por outra instância.
 
 ## Hash de payload
 
@@ -79,7 +91,7 @@ SHA-256 de JSON canônico com chaves ordenadas recursivamente. Inclui apenas `pr
 | `INSUFFICIENT_FUNDS` | Aposta sem saldo |
 | `REVERSAL_INSUFFICIENT_FUNDS` | Reversão produziria saldo negativo |
 | `WALLET_MISMATCH` | Wallet ou jogador incompatíveis |
-| `REFERENCE_NOT_FOUND` | Referência não resolvida até o futuro limite de tentativas/TTL |
+| `REFERENCE_NOT_FOUND` | Referência não resolvida até o limite de tentativas/TTL |
 | `REFERENCE_NOT_PROCESSED` | Referência concluída sem sucesso |
 | `REFERENCE_MISMATCH` | Identidade da referência divergente |
 | `INVALID_REFERENCE_KIND` | Tipo de referência inválido |
@@ -89,7 +101,7 @@ SHA-256 de JSON canônico com chaves ordenadas recursivamente. Inclui apenas `pr
 | `INFRASTRUCTURE_FAILURE` | Falha permanente de infraestrutura |
 | `INVALID_TRANSACTION_STATE`, `INVALID_LEDGER` | Violação interna de transição ou lançamento |
 
-O mapeamento HTTP separa `400` (entrada inválida), `404` (recurso ausente), `409` (conflito), `422` (rejeição de negócio), `202` (pendente), `503` (falha transitória) e `500` (erro interno). Consultas bem-sucedidas retornam `200`, mesmo quando o estado consultado é rejeitado. Os contratos são validados no caso de uso para que a futura fila utilize as mesmas regras. Erros internos não expõem SQL nem payloads financeiros.
+O mapeamento HTTP separa `400` (entrada inválida), `404` (recurso ausente), `409` (conflito), `422` (rejeição de negócio), `202` (pendente), `503` (falha transitória) e `500` (erro interno). Consultas bem-sucedidas retornam `200`, mesmo quando o estado consultado é rejeitado. Os contratos são validados no caso de uso para que HTTP e fila utilizem as mesmas regras. Erros internos não expõem SQL nem payloads financeiros.
 
 O ledger usa cursor opaco contendo wallet e versão. A versão é imutável e estritamente crescente, evitando problemas com timestamps iguais ou precisão de datas. Limite de página: 1 a 100. O cursor não é uma credencial de autorização.
 
@@ -97,13 +109,13 @@ O ledger usa cursor opaco contendo wallet e versão. A versão é imutável e es
 
 Os testes unitários verificam dinheiro, operações, rejeições, referências, estados terminais, hash, snapshots e mapeamentos. A validação de metadados TypeORM não abre conexão. O teste sequencial de duas apostas verifica a regra de saldo, mas não comprova concorrência real.
 
-Os 63 testes de integração/HTTP usam PostgreSQL 17.6 e LocalStack 4.7.0 reais. Verificam migrations, constraints, ledger, referências, unicidade da inbox, atomicidade SQL, contratos, replay, paginação e erros. Uma falha injetada na inserção da outbox confirma que o endpoint não deixa débito parcial. Depois de cada teste financeiro, a suíte reconstrói o saldo somando o ledger. Cada execução cria e remove seu próprio banco. O teste de SQS verifica apenas existência das filas, FIFO e política de DLQ.
+Os 84 testes de integração/HTTP/mensageria usam PostgreSQL 17.6 e LocalStack 4.7.0 reais. Verificam migrations, constraints, ledger, referências, unicidade da inbox, atomicidade SQL, contratos, replay, paginação e erros. Uma falha injetada na inserção da outbox confirma que o endpoint não deixa débito parcial. Depois de cada teste financeiro, a suíte reconstrói o saldo somando o ledger. Cada execução cria e remove seu próprio banco. A mensageria usa filas temporárias e cobre retry, DLQ, publishers concorrentes, TTL, falhas de processos e shutdown.
 
 A execução real identificou e corrigiu uma expressão `CASE` que precisava de parênteses dentro do `IF` de um trigger. Também confirmou que `Infinity` falha no próprio `NUMERIC(20,2)` com SQLSTATE `22003`, enquanto `NaN` é recusado pelo check com `23514`.
 
 Cinco testes de concorrência iniciam três processos reais: 50 duplicatas causam um débito; duas apostas de 80 disputam saldo 100; chave global entre wallets não duplica efeitos; um lock não bloqueia outra wallet; replay permanece seguro após reiniciar um processo. Os processos são encerrados e o banco temporário é removido.
 
-Faltam processamento SQS, publishers concorrentes, reprocessamento de referências e seus testes de retry, DLQ e falhas após commit/antes do ack. Readiness, logs de processamento completos, métricas adicionais e shutdown dos workers também estão pendentes. Os logs de bootstrap já usam JSON e a reconciliação possui uma métrica Prometheus, mas isso ainda não cobre toda a observabilidade exigida.
+Readiness, logs de processamento HTTP completos e métricas adicionais continuam pendentes. Os logs de bootstrap e workers usam JSON; a reconciliação e os workers expõem métricas Prometheus, mas isso ainda não cobre toda a observabilidade exigida.
 
 ## Autenticação
 

@@ -4,6 +4,10 @@ import type { WalletLedgerEntry } from '../domain/wallet-ledger-entry';
 import type { IntegrationEvent } from './integration-events';
 
 export interface FinancialSession {
+  receiveInbox(consumer: string, messageId: string, hash: string): Promise<void>;
+  finishInbox(consumer: string, messageId: string): Promise<void>;
+  referenceSchedule(id: string): Promise<{ attempts: number; nextAt: Date | null; expiresAt: Date | null }>;
+  updateTransaction(tx: WagerTransaction, attempts: number, nextAt: Date | null, expiresAt: Date | null): Promise<void>;
   findWallet(id: string, lock?: boolean): Promise<Wallet | null>;
   insertWallet(wallet: Wallet): Promise<void>;
   updateWallet(wallet: Wallet): Promise<void>;
