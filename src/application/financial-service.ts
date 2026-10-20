@@ -127,16 +127,17 @@ export class FinancialService {
   }
 
   // Após esgotar retries, registra falha sem sobrescrever qualquer resultado já confirmado.
-  async auditDeliveryFailure(input: unknown, keyInput: unknown, ctx: EventContext): Promise<void> {
+  async auditDeliveryFailure(input: unknown, keyInput: unknown, ctx: EventContext): Promise<boolean> {
     const payload = parseTransaction(input); const key = identifier(keyInput);
-    await this.store.transaction(async session => {
+    return this.store.transaction(async session => {
       await this.requireWallet(session, payload.walletId, true);
-      if (await session.byKey(key) || await session.byExternal(payload.providerId, payload.externalTransactionId)) return;
+      if (await session.byKey(key) || await session.byExternal(payload.providerId, payload.externalTransactionId)) return false;
       const tx = WagerTransaction.create({ ...payload, id: crypto.randomUUID(), idempotencyKey: key,
         payloadHash: hashTransactionPayload(payload), money: Money.from(payload.money), createdAt: new Date() });
       tx.fail('INFRASTRUCTURE_FAILURE', new Date());
       await session.insertTransaction(tx);
       await session.enqueue(WagerTransactionFailed.from(tx, ctx));
+      return true;
     });
   }
 

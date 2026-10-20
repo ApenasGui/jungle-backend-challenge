@@ -16,6 +16,6 @@ export function createDataSource(): DataSource {
     synchronize: false,
     migrationsRun: false,
     logging: false,
-    extra: { connectionTimeoutMillis: 5000 },
+    extra: { connectionTimeoutMillis: 5000, statement_timeout: 10000 },
   });
 }

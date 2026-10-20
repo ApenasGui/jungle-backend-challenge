@@ -18,7 +18,7 @@ export class WorkerRuntime {
   private tasks: Promise<void>[] = [];
   private readonly pauseAbort = new AbortController();
   constructor(source: DataSource, client: SQSClient, queues: QueueConfig) {
-    const service = new FinancialService(new TypeOrmFinancialStore(source), new FinancialDiagnosticsService());
+    const service = new FinancialService(new TypeOrmFinancialStore(source, this.metrics), new FinancialDiagnosticsService());
     this.consumer = new SqsConsumer(client, queues, service, this.metrics);
     this.publisher = new OutboxPublisher(source, client, queues.eventsUrl, this.metrics);
     this.references = new ReferenceWorker(source, service, this.metrics);

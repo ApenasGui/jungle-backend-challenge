@@ -18,7 +18,6 @@ export class OutboxPublisher {
         .limit(1).setLock('pessimistic_write').setOnLocked('skip_locked').getOne();
       if (!row) return false;
       const event = OutboxMessage.rehydrate(row);
-      this.metrics.gauge('wagering_outbox_lag_seconds', Math.max(0, (Date.now() - row.occurredAt.getTime()) / 1000));
       try {
         await this.client.send(new SendMessageCommand({ QueueUrl: this.queueUrl,
           MessageBody: JSON.stringify(row.payload), MessageGroupId: row.aggregateId, MessageDeduplicationId: row.id,
@@ -28,6 +27,7 @@ export class OutboxPublisher {
         const retry = event.snapshot();
         await manager.update(OutboxSchema, row.id, { attempts: retry.attempts, nextAttemptAt: retry.nextAttemptAt });
         this.metrics.increment('wagering_outbox_retries_total');
+        this.metrics.retry();
         return true;
       }
       await this.hooks.afterPublish?.();

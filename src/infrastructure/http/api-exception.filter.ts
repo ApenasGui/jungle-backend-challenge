@@ -18,7 +18,8 @@ export class ApiExceptionFilter implements ExceptionFilter {
       status = error.getStatus();
       code = status === 404 ? 'NOT_FOUND' : status === 400 ? 'INVALID_PAYLOAD' : 'HTTP_ERROR';
     }
-    if (status >= 500) console.error(JSON.stringify({ level: 'error', event: 'http_error', code, status }));
+    if (status >= 500) console.error(JSON.stringify({ level: 'error', event: 'http_error', code, status,
+      correlationId: host.switchToHttp().getRequest().headers['x-correlation-id'] }));
     const response = host.switchToHttp().getResponse();
     if (status === 503) response.setHeader('Retry-After', '1');
     response.status(status).json({ statusCode: status, code });

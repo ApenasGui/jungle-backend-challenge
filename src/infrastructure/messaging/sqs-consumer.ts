@@ -60,7 +60,7 @@ export class SqsConsumer {
       const result = await this.service.submit(payload, idempotencyKey, {
         correlationId: parsed.correlationId ?? parsed.messageId, causationId: parsed.messageId,
       }, { consumer: 'wager-transactions', messageId: parsed.messageId });
-      this.metrics.increment(`wagering_transactions_${result.status.toLowerCase()}_total`);
+      if (!result.idempotentReplay) this.metrics.increment(`wagering_transactions_${result.status.toLowerCase()}_total`);
       if (result.idempotentReplay) this.metrics.increment('wagering_duplicates_total');
       this.metrics.log('transaction_committed', { messageId: parsed.messageId, transactionId: result.transactionId,
         walletId: typeof payload.walletId === 'string' ? payload.walletId : undefined,
@@ -86,8 +86,9 @@ export class SqsConsumer {
         if (!permanent && parsed) {
           const { idempotencyKey, ...payload } = parsed.data;
           try {
-            await this.service.auditDeliveryFailure(payload, idempotencyKey, {
+            const recorded = await this.service.auditDeliveryFailure(payload, idempotencyKey, {
               correlationId: parsed.correlationId ?? parsed.messageId, causationId: parsed.messageId });
+            if (recorded) this.metrics.increment('wagering_transactions_failed_total');
           } catch {
             // Se o banco continua indisponível, o corpo original já está preservado na DLQ.
             this.metrics.increment('wagering_failure_audit_errors_total');

@@ -4,6 +4,7 @@ import { NestFactory } from '@nestjs/core';
 import type { DataSource } from 'typeorm';
 import { AppModule } from './app.module';
 import { ApiExceptionFilter } from './infrastructure/http/api-exception.filter';
+import { installHttpObservability } from './infrastructure/http/http-observability';
 
 // HTTP usa o mesmo bootstrap nos testes e na execução normal.
 export async function createApplication(source?: DataSource, silent = false) {
@@ -11,6 +12,7 @@ export async function createApplication(source?: DataSource, silent = false) {
     logger: silent ? false : new ConsoleLogger({ json: true }), abortOnError: false,
   });
   app.useGlobalFilters(new ApiExceptionFilter());
+  installHttpObservability(app);
   app.enableShutdownHooks();
   return app;
 }

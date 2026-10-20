@@ -6,7 +6,7 @@ Implementação do [desafio da Jungle Gaming](https://github.com/junglegaming/ba
 
 API financeira em NestJS, TypeScript estrito e TypeORM, com domínio financeiro, migrations reversíveis e testes unitários, HTTP, integração e concorrência real. Os casos de uso processam abertura, apostas, ganhos, perdas e reversões em transações PostgreSQL, com lock por wallet, idempotência persistente e eventos gravados na outbox.
 
-O worker SQS compartilha o caso de uso da API, persiste a inbox, publica a outbox e reprocessa referências pendentes. Inclui retry, DLQ e encerramento gracioso. Ainda faltam readiness e observabilidade completa. Os endpoints estão sem autenticação nesta etapa.
+O worker SQS compartilha o caso de uso da API, persiste a inbox, publica a outbox e reprocessa referências pendentes. Inclui retry, DLQ e encerramento gracioso. Readiness, logs JSON correlacionados e métricas Prometheus estão implementados. Autenticação externa foi deixada fora do escopo, com ponto de extensão explícito e decisão documentada.
 
 ## Requisitos
 
@@ -25,7 +25,7 @@ bun run dev
 
 O Bun carrega `.env` automaticamente. As credenciais do exemplo são exclusivas para desenvolvimento local.
 
-Em outro terminal, na mesma pasta, execute `bun run worker`. Ele consome a fila de entrada, publica eventos e resolve referências pendentes. Expõe `/health/live` e `/metrics` na porta `3001`, configurável por `WORKER_PORT`.
+Em outro terminal, na mesma pasta, execute `bun run worker`. Ele consome a fila de entrada, publica eventos e resolve referências pendentes. Expõe `/health/live`, `/health/ready` e `/metrics` na porta `3001`, configurável por `WORKER_PORT`.
 
 ## Comandos
 
@@ -58,7 +58,7 @@ bun run test:integration
 
 A suíte cria bancos exclusivos `wagering_test_<uuid>` e os remove ao terminar; não limpa nem reverte o banco de desenvolvimento. `TEST_DATABASE_ADMIN_URL` deve apontar para PostgreSQL local com permissão de criar bancos. Os testes de banco aplicam suas próprias migrations e não dependem da aplicação prévia em `wagering`. Uma interrupção forçada do processo pode deixar um banco temporário para limpeza manual.
 
-São 85 testes unitários, 84 de integração/HTTP/mensageria e 5 de concorrência. Os testes reais cobrem persistência decimal, unicidade, imutabilidade, cadeia do ledger, reversões, rollback antes e durante o commit e configuração FIFO/DLQ do LocalStack. Também verificam contratos HTTP, replay, paginação, indisponibilidade e falha de gravação da outbox. Após cada teste financeiro, o saldo é comparado com a soma do ledger. Os testes de mensageria criam e removem filas próprias; não consomem as filas de desenvolvimento. `bun test --timeout 30000` executa todas as suítes e exige os containers ativos.
+São 85 testes unitários, 91 de integração/HTTP/mensageria/observabilidade e 5 de concorrência. Os testes reais cobrem persistência decimal, unicidade, imutabilidade, cadeia do ledger, reversões, rollback antes e durante o commit e configuração FIFO/DLQ do LocalStack. Também verificam contratos HTTP, replay, paginação, indisponibilidade e falha de gravação da outbox. Após cada teste financeiro, o saldo é comparado com a soma do ledger. Os testes de mensageria criam e removem filas próprias; não consomem as filas de desenvolvimento. `bun test --timeout 30000` executa todas as suítes e exige os containers ativos.
 
 A suíte de concorrência inicia três processos reais da API em portas aleatórias: envia 50 duplicatas, disputa saldo, testa chaves globais entre wallets e verifica independência dos locks. Também reinicia um processo e confirma replay persistente. A suíte de mensageria encerra processos reais após commit/antes do ack e após envio/antes de marcar a outbox, verificando a recuperação. Inclui publishers concorrentes, retry, DLQ, TTL e shutdown. Os processos, bancos e filas temporários são removidos ao terminar.
 
@@ -102,7 +102,8 @@ A outbox usa entrega pelo menos uma vez: consumidores dos eventos devem deduplic
 | `GET /wagering/transactions/:transactionId` | Consultar pelo ID interno |
 | `GET /providers/:providerId/wagering/transactions/:externalTransactionId` | Consultar pelo ID do provedor |
 | `GET /health/live` | Verificar processo vivo |
-| `GET /metrics` | Métrica de divergências da reconciliação; demais métricas estão pendentes |
+| `GET /health/ready` | Verificar PostgreSQL e as três filas SQS; 200 ou 503 |
+| `GET /metrics` | Métricas Prometheus do processo e estado persistido |
 
 Valores monetários devem ser strings com exatamente duas casas. Campos desconhecidos são rejeitados. `OPENING` é interno. O cursor do ledger é opaco, restrito à wallet e usa sua versão monotônica; `limit` aceita de 1 a 100.
 
@@ -129,6 +130,39 @@ Invoke-RestMethod -Method Post -Uri http://localhost:3000/wagering/transactions 
 ```
 
 Repetir o último comando devolve a mesma transação e o saldo original, com `idempotentReplay: true`. Enviar o mesmo ID externo com outra chave retorna conflito, mesmo que o payload seja igual. `x-correlation-id` é opcional e acompanha os eventos; na ausência de um identificador válido, a API gera um UUID.
+
+## Verificação operacional
+
+Com API e worker ativos:
+
+```powershell
+Invoke-RestMethod http://localhost:3000/health/live
+Invoke-RestMethod http://localhost:3000/health/ready
+Invoke-RestMethod http://localhost:3001/health/ready
+(Invoke-WebRequest http://localhost:3000/metrics).Content
+(Invoke-WebRequest http://localhost:3001/metrics).Content
+```
+
+Readiness responde `503` quando PostgreSQL ou qualquer fila configurada está inacessível. Liveness indica apenas que o processo responde. As sondas não consomem mensagens. `x-correlation-id` é devolvido no HTTP e acompanha os eventos; quando ausente ou inválido, recebe um UUID.
+
+| Métrica | Interpretação |
+| --- | --- |
+| `wagering_transactions_current{status="..."}` | Quantidade persistida em cada estado, incluindo abertura |
+| `wagering_transactions_<status>_total` | Resultados novos observados pelo processo na entrada ou reprocessamento |
+| `wagering_duplicates_total` | Replays detectados pelo processo |
+| `wagering_retries_total` | Novas tentativas de SQL, mensagem, referência ou publicação |
+| `wagering_dlq_messages_total` | Encaminhamentos à DLQ confirmados pelo consumidor |
+| `wagering_lock_conflicts_total` | Deadlocks e timeouts de lock detectados pelo adaptador |
+| `wagering_outbox_pending` | Eventos ainda não marcados como publicados |
+| `wagering_outbox_lag_seconds` | Idade do evento pendente mais antigo; zero quando vazia |
+| `wagering_processing_duration_seconds` | Histograma de latência HTTP ou de processamento SQS |
+| `wagering_reconciliation_mismatches_total` | Divergências encontradas pela reconciliação |
+
+Contadores e histogramas pertencem a cada processo e reiniciam com ele. Os gauges consultados no banco representam o mesmo estado compartilhado em todas as instâncias: não devem ser somados entre réplicas. Os campos `*_collection_success` valem zero quando a coleta falha; nesse caso, os gauges afetados são omitidos. Métricas são operacionais, não substituem a auditoria persistida.
+
+Para três instâncias da API, abra três terminais e execute `bun run start` com `PORT` definido como `3000`, `3002` e `3003`, respectivamente (`$env:PORT='3002'` no PowerShell). Workers adicionais devem ter `WORKER_PORT` diferente, usando o mesmo banco e filas. A suíte `bun run test:concurrency` já automatiza a validação com três processos isolados.
+
+Se a outbox acumular eventos, verifique readiness do worker, configuração da fila de eventos e logs de retry. Se houver mensagem na DLQ, investigue o `failureCode` e consulte a transação antes de reenviar. Preserve `messageId`, chave de idempotência e payload original ao repetir uma mensagem transitória. Uma transação terminal `FAILED` ou `REJECTED` não muda por replay; não altere registros terminais manualmente para forçar processamento.
 
 ## Estrutura
 

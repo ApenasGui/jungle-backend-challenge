@@ -15,7 +15,8 @@ function sqlCode(error: unknown): string | undefined {
 }
 
 export class TypeOrmFinancialStore implements FinancialStore {
-  constructor(private readonly source: DataSource) {}
+  constructor(private readonly source: DataSource,
+    private readonly diagnostics?: { lockConflict(): void; retry(): void }) {}
 
   // Só repete transações abortadas pelo PostgreSQL; resultado de commit incerto não é repetido aqui.
   async transaction<T>(work: (session: FinancialSession) => Promise<T>): Promise<T> {
@@ -29,7 +30,9 @@ export class TypeOrmFinancialStore implements FinancialStore {
         });
       } catch (error) {
         const code = sqlCode(error);
+        if (['40P01', '55P03'].includes(code ?? '')) this.diagnostics?.lockConflict();
         if (['40001', '40P01', '55P03'].includes(code ?? '') && attempt < 2) {
+          this.diagnostics?.retry();
           await Bun.sleep(20 * (attempt + 1));
           continue;
         }

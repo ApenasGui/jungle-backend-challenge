@@ -2,7 +2,7 @@
 
 ## Estado atual e organização
 
-O domínio financeiro, os mapeamentos TypeORM, a migration, a API financeira e os workers estão implementados. Casos de uso dependem da porta `FinancialStore`, sem importar NestJS ou TypeORM. O adaptador fornece uma sessão com o mesmo `EntityManager` para cada transação. A migration foi aplicada no PostgreSQL 17.6 e validada com rollback/reaplicação. Readiness e observabilidade completa continuam pendentes.
+O domínio financeiro, os mapeamentos TypeORM, a migration, a API financeira e os workers estão implementados. Casos de uso dependem da porta `FinancialStore`, sem importar NestJS ou TypeORM. O adaptador fornece uma sessão com o mesmo `EntityManager` para cada transação. A migration foi aplicada no PostgreSQL 17.6 e validada com rollback/reaplicação. Readiness, métricas Prometheus e logs JSON correlacionados estão implementados.
 
 NestJS organiza HTTP e injeção de dependências. Bun 1.4.3 executa aplicação, instalação e testes; TypeScript verifica tipos e compila o código. TypeORM foi escolhido por familiaridade do candidato. Usamos `EntitySchema` para manter o domínio sem decorators ou dependências do ORM. Mappers explícitos reconstroem as classes pelas factories `rehydrate`, sem reaplicar transições.
 
@@ -109,14 +109,30 @@ O ledger usa cursor opaco contendo wallet e versão. A versão é imutável e es
 
 Os testes unitários verificam dinheiro, operações, rejeições, referências, estados terminais, hash, snapshots e mapeamentos. A validação de metadados TypeORM não abre conexão. O teste sequencial de duas apostas verifica a regra de saldo, mas não comprova concorrência real.
 
-Os 84 testes de integração/HTTP/mensageria usam PostgreSQL 17.6 e LocalStack 4.7.0 reais. Verificam migrations, constraints, ledger, referências, unicidade da inbox, atomicidade SQL, contratos, replay, paginação e erros. Uma falha injetada na inserção da outbox confirma que o endpoint não deixa débito parcial. Depois de cada teste financeiro, a suíte reconstrói o saldo somando o ledger. Cada execução cria e remove seu próprio banco. A mensageria usa filas temporárias e cobre retry, DLQ, publishers concorrentes, TTL, falhas de processos e shutdown.
+Os 91 testes de integração/HTTP/mensageria/observabilidade usam PostgreSQL 17.6 e LocalStack 4.7.0 reais. Verificam migrations, constraints, ledger, referências, unicidade da inbox, atomicidade SQL, contratos, replay, paginação e erros. Uma falha injetada na inserção da outbox confirma que o endpoint não deixa débito parcial. Depois de cada teste financeiro, a suíte reconstrói o saldo somando o ledger. Cada execução cria e remove seu próprio banco. A mensageria usa filas temporárias e cobre retry, DLQ, publishers concorrentes, TTL, falhas de processos e shutdown.
 
 A execução real identificou e corrigiu uma expressão `CASE` que precisava de parênteses dentro do `IF` de um trigger. Também confirmou que `Infinity` falha no próprio `NUMERIC(20,2)` com SQLSTATE `22003`, enquanto `NaN` é recusado pelo check com `23514`.
 
 Cinco testes de concorrência iniciam três processos reais: 50 duplicatas causam um débito; duas apostas de 80 disputam saldo 100; chave global entre wallets não duplica efeitos; um lock não bloqueia outra wallet; replay permanece seguro após reiniciar um processo. Os processos são encerrados e o banco temporário é removido.
 
-Readiness, logs de processamento HTTP completos e métricas adicionais continuam pendentes. Os logs de bootstrap e workers usam JSON; a reconciliação e os workers expõem métricas Prometheus, mas isso ainda não cobre toda a observabilidade exigida.
+A validação de observabilidade cobre readiness com banco indisponível e fila ausente, liveness independente das dependências, correlação de logs e eventos, ausência de valores financeiros nos logs, backlog da outbox e conflitos reais de lock.
+
+## Observabilidade e limites operacionais
+
+API e worker expõem liveness e readiness separadamente. Readiness faz `SELECT 1` em conexão dedicada, com timeout de conexão e consulta de 2 segundos, e consulta atributos das três filas em paralelo, com timeout de 2 segundos por chamada. Não publica nem recebe mensagens. Durante shutdown, a aplicação deixa de indicar que aceita trabalho. Uma falha de dependência retorna apenas flags, sem credenciais ou mensagens internas.
+
+Logs HTTP registram rota, status, duração e identificadores disponíveis. O `correlationId` é validado, devolvido no header e reutilizado pelos eventos. Logs SQS adicionam `messageId`; um request HTTP não tem esse identificador. Os logs omitem headers de autorização, chave de idempotência, corpos, saldos e valores. Health e scrape de métricas não geram logs de processamento.
+
+Métricas de resultados e retries são contadores locais e podem perder uma atualização se o processo morrer imediatamente após o commit. Por isso, também expomos gauges de transações por estado consultando o PostgreSQL, incluindo `OPENING`. Replays contam como duplicatas e não como novos resultados. Uma referência pode passar por pendência e depois por estado terminal: os contadores de resultados não representam transações únicas. A latência usa histograma com buckets entre 10 ms e 15 s, além de `+Inf`.
+
+Outbox lag mede a idade do evento pendente mais antigo, inclusive durante backoff, e zera quando a fila SQL esvazia. Contadores de envio à DLQ medem encaminhamentos confirmados pelo processo, não o tamanho atual da fila. Conflitos de lock incluem SQLSTATE `40P01` e `55P03`; tentativas de serialização também entram em retries. Os gauges compartilhados não devem ser somados entre réplicas.
+
+As coletas SQL de métricas usam o pool com timeout de conexão de 5 segundos e statement timeout de 10 segundos. Uma coleta falha remove seus gauges e sinaliza `collection_success=0`, evitando expor zero como se fosse um resultado válido. A contagem por estado faz agregação sobre o histórico: para volumes grandes, precisaria de coleta periódica/cache ou agregação dedicada. Um scrape por instância a cada 15–30 segundos é suficiente para o ambiente de demonstração.
+
+Não foram adicionados dashboard, tracing distribuído, teste de carga ou IdP. A entrega usa PostgreSQL e LocalStack locais; não foi validada em uma conta AWS real. O publisher mantém uma transação SQL aberta durante o envio, limitado a 5 segundos: isso simplifica a reserva e recuperação, com custo de conexão ocupada. Uma evolução para alto volume pode usar leases persistidos, mantendo entrega pelo menos uma vez e deduplicação por `eventId`.
 
 ## Autenticação
 
-A proposta é adiar a integração com IdP e documentar o ponto de extensão, priorizando os requisitos financeiros. Essa decisão ainda deve ser confirmada com o candidato; nenhum mecanismo de autenticação foi implementado nesta etapa.
+A integração com IdP foi deixada fora do escopo para priorizar correção financeira e recuperação distribuída dentro do prazo. O ProviderAuthGuard está aplicado ao controller financeiro e libera o acesso explicitamente; ele é um ponto de extensão, não uma proteção de segurança. Health permanece público e SQS é tratado como canal interno.
+
+Em uma implantação autenticada, o guard validaria assinatura via JWKS, issuer, audience e expiração de um access token emitido por Keycloak ou outro IdP OIDC. Uma política de autorização associaria o principal ao providerId permitido e ao escopo de wallets, incluindo consultas e criação. O providerId informado no body não seria prova de identidade. Nenhuma tabela de senhas ou autenticação artesanal seria adicionada.
