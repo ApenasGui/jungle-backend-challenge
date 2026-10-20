@@ -1,0 +1,43 @@
+{
+  "name": "distributed-wagering-processor",
+  "version": "0.1.0",
+  "private": true,
+  "packageManager": "bun@1.4.3",
+  "engines": {
+    "bun": "1.x"
+  },
+  "scripts": {
+    "dev": "bun --watch src/main.ts",
+    "start": "bun src/main.ts",
+    "build": "tsc -p tsconfig.build.json",
+    "start:prod": "bun dist/main.js",
+    "typecheck": "tsc --noEmit",
+    "test": "bun test",
+    "test:unit": "bun test tests/unit",
+    "test:integration": "bun test tests/integration --timeout 30000",
+    "test:concurrency": "bun test tests/concurrency --timeout 30000",
+    "migration:run": "bun scripts/migrate.ts run",
+    "migration:revert": "bun scripts/migrate.ts revert",
+    "infra:up": "docker compose up -d --wait",
+    "infra:down": "docker compose down"
+  },
+  "dependencies": {
+    "@aws-sdk/client-sqs": "3.1153.0",
+    "@nestjs/common": "11",
+    "@nestjs/core": "11",
+    "@nestjs/platform-express": "11",
+    "@nestjs/typeorm": "11",
+    "class-transformer": "0.5.1",
+    "class-validator": "0.15.1",
+    "decimal.js": "10.6.0",
+    "pg": "8.23.1",
+    "reflect-metadata": "0.2.2",
+    "rxjs": "7.8.2",
+    "typeorm": "0.3"
+  },
+  "devDependencies": {
+    "@types/bun": "1.4.3",
+    "@types/pg": "8.23.1",
+    "typescript": "5"
+  }
+}
