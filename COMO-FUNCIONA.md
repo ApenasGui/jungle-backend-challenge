@@ -709,31 +709,6 @@ bun run start
 
 Workers adicionais precisam de `WORKER_PORT` distinto. O teste de concorrência já automatiza a execução de três processos da API.
 
-## 17. Roteiro para estudar e apresentar
-
-Uma ordem de leitura útil:
-
-1. `Money` e `Wallet`: entenda as regras financeiras sem HTTP ou banco.
-2. `WagerTransaction` e ledger: entenda identidade, estados e auditoria.
-3. `FinancialService.submit`: acompanhe o caso de uso completo.
-4. `TypeOrmFinancialStore` e migration: veja como as garantias chegam ao banco.
-5. `SqsConsumer`, outbox e referências: acompanhe duplicatas, falhas e recuperação.
-6. Testes de concorrência e mensageria: veja as garantias sendo exercitadas.
-7. Observabilidade: entenda como diagnosticar o sistema em execução.
-
-Para uma demonstração, crie uma wallet, envie uma BET, repita a mesma chave, consulte o ledger e execute a reconciliação. Depois mostre os testes da disputa de saldo e de queda após commit.
-
-Na explicação técnica, consiga responder:
-
-- Por que o dinheiro é representado por string e decimal?
-- Por que a chave precisa estar no banco?
-- Por que consultar a duplicata antes e depois do lock?
-- O que acontece se a gravação da outbox falhar?
-- O que acontece se o processo morrer antes do ack?
-- Por que um evento pode ser publicado duas vezes?
-- Como a referência fora de ordem é resolvida?
-- Quais métricas são locais e quais representam estado compartilhado?
-- Quais escolhas ainda exigem discussão de negócio ou evolução para produção?
 
 Documentos complementares:
 
